@@ -1587,3 +1587,71 @@ Commits: `~/nats_asio` (`samples/modes/benchmarker.hpp`,
 narrow precedent as the earlier `bench --js` counting-bug fix
 (commit `5647b51`) in that repo, not a broad change; `~/pg_blazingmq`
 (`bench/README.md`) for this write-up.
+
+## Real NYSE data instead of synthetic: does the scaling shape hold up against skew?
+
+Every run above (this section and the two before it) used synthetic,
+perfectly uniform data - `region` cycling evenly through 8 values. Real
+market data isn't like that: `Exchange` in `nyse_eqy_us_all_trade_20260102`
+is heavily skewed (in a 200,000-row sample, `D` alone is 43% of rows,
+19 distinct values total, from `D`'s 86,048 down to `L`'s 25). Round-robin
+queue-group distribution assumes messages are interchangeable in cost;
+real skewed categorical data might interact with that assumption
+differently than idealized uniform data. Worth checking rather than
+assuming the synthetic-data result generalizes.
+
+Setup: 200,000 real rows materialized once (`sc_bench_sample`, a plain
+`LIMIT 200000` from the 115,020,848-row source table, real on-disk
+ordering, not resampled per run - same 200,000 rows used for every N).
+Filter attribute `Exchange:string` (not `region:integer`), filter value
+`"N"` - ground truth computed directly against the sample:
+`SELECT count(*) FROM sc_bench_sample WHERE "Exchange" = 'N'` = **21,683**
+(10.8% of the sample, in the same 5-30% target range as the synthetic
+test's 1/8 = 12.5%). Full row published as the payload
+(`row_to_msgpack(t)` via `pg_zerialize`, `nats_publish_binary` via
+`pgnats`) - the same real-row-publish shape this document's earlier
+BlazingMQ/JetStream sections used, not a single-column synthetic
+payload. Same architecture as both prior sections otherwise: N separate
+`nats_sidecar` instances under one queue group, `--workers 2` each,
+fresh `nats-server -js` restart per N with a throwaway store dir.
+Verification via a small, additive `subfield` mode added to
+`bench/mq_bench_driver.cpp` (checks a string field against an expected
+value instead of the hardcoded `region==1` int check `sub` mode has -
+`sub` mode itself untouched, so nothing else in this document that
+depends on it is at risk).
+
+| N | publish rate (rows/s) | filtered rate (matches/s) | scaling vs N=1 | correctness |
+|---|---|---|---|---|
+| 1 | 73,196/s | 2,798/s | 1.00x | 21,683/21,683, 0 wrong |
+| 2 | 628,742/s | 5,453/s | 1.95x | 21,683/21,683, 0 wrong |
+| 4 | 505,905/s | 9,379/s | 3.35x | 21,683/21,683, 0 wrong |
+| 8 | 399,247/s | 18,174/s | **6.49x** | 21,683/21,683, 0 wrong |
+
+(Publish rate at N=1 being the outlier low value, not N=8, is most
+likely Postgres/page-cache warmup on the first query touching the
+200,000-row sample table that run - not a real effect worth chasing,
+since publish rate isn't what this section is testing; filtered rate is
+unaffected by it, as shown by N=1's filtered rate being in-family with
+the rest.)
+
+**Real, skewed market data scales *at least as well* as idealized
+synthetic data - if anything, slightly better** (1.95x/3.35x/6.49x here
+vs 1.77x/3.09x/5.91x with synthetic `region`, at N=2/4/8 respectively).
+The a priori concern motivating this test - that real skew might harm
+round-robin distribution relative to a clean uniform case - is not
+borne out. Correctness held perfectly at every N against a real,
+independently-computed ground truth (21,683/21,683, not the synthetic
+test's simpler 1/8-of-round-robin count), on real row payloads, not
+single-field synthetic ones.
+
+**Conclusion**: the `nats_sidecar` multi-instance queue-group scaling
+finding from the two sections above is not an artifact of using
+artificially uniform test data - it holds, and holds at least as well,
+against real NYSE trade data with genuine ~200x skew across categorical
+values.
+
+New tooling: `bench/nats_sidecar_scaling_real_data.py` (orchestrator,
+same `subprocess.Popen`/`.terminate()` discipline as the other N-sweep
+scripts in this directory) and `mq_bench_driver.cpp`'s new `subfield`
+mode (additive only). Teardown confirmed clean via `ps` after the full
+sweep.

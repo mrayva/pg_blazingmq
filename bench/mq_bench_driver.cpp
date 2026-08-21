@@ -144,6 +144,68 @@ asio::awaitable<void> do_sub(asio::io_context& ioc, std::string pattern, long ex
     co_return;
 }
 
+// subfield <subject_pattern> <expected_count> <timeout_ms> <field> <expected_value>:
+// like sub, but verifies a string field == expected_value instead of the
+// hardcoded region==1 int check (for real-data tests with a string
+// attribute, e.g. Exchange).
+asio::awaitable<void> do_subfield(asio::io_context& ioc, std::string pattern, long expected,
+                                   int timeout_ms, std::string field, std::string expected_value) {
+    std::atomic<bool> connected{false};
+    auto conn = make_conn(ioc, connected);
+    nats_asio::connect_config conf;
+    conf.address = "127.0.0.1";
+    conf.port = 4222;
+    conn->start(conf);
+    co_await wait_connected(ioc, connected);
+
+    auto total = std::make_shared<std::atomic<long>>(0);
+    auto wrong = std::make_shared<std::atomic<long>>(0);
+    auto t0 = std::make_shared<std::chrono::steady_clock::time_point>(std::chrono::steady_clock::now());
+    auto first_msg = std::make_shared<bool>(true);
+
+    nats_asio::subscribe_options opts;
+    auto [sub, status] = co_await conn->subscribe(
+        pattern,
+        [total, wrong, t0, first_msg, field, expected_value](
+            nats_asio::string_view, std::optional<nats_asio::string_view>,
+            std::span<const char> payload) -> asio::awaitable<void> {
+            if (*first_msg) { *t0 = std::chrono::steady_clock::now(); *first_msg = false; }
+            try {
+                std::span<const uint8_t> bytes(
+                    reinterpret_cast<const uint8_t*>(payload.data()), payload.size());
+                z::MsgPackDeserializer doc(bytes);
+                std::string val(doc[field].asString());
+                if (val != expected_value) wrong->fetch_add(1);
+            } catch (...) {
+                wrong->fetch_add(1);
+            }
+            total->fetch_add(1);
+            co_return;
+        },
+        opts);
+    if (status.failed()) {
+        std::cerr << "subscribe failed: " << status.error() << "\n";
+        co_return;
+    }
+
+    asio::steady_timer t(ioc);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (total->load() < expected && std::chrono::steady_clock::now() < deadline) {
+        t.expires_after(std::chrono::milliseconds(10));
+        co_await t.async_wait(asio::use_awaitable);
+    }
+    t.expires_after(std::chrono::milliseconds(300));
+    co_await t.async_wait(asio::use_awaitable);
+
+    auto t1 = std::chrono::steady_clock::now();
+    double secs = std::chrono::duration<double>(t1 - *t0).count();
+    long tot = total->load();
+    std::cout << "SUB_DONE total=" << tot << " wrong=" << wrong->load()
+              << " secs=" << secs << " rate=" << (secs > 0 ? tot / secs : 0.0) << "\n";
+    ioc.stop();
+    co_return;
+}
+
 // ctrl <subscribe_subject> <expression>: send {"expression":..., "client_id":"bench"}
 // request, print the reply, exit.
 asio::awaitable<void> do_ctrl(asio::io_context& ioc, std::string subject, std::string expr) {
@@ -176,6 +238,9 @@ int main(int argc, char** argv) {
         asio::co_spawn(ioc, do_pub(ioc, argv[2], std::atol(argv[3])), asio::detached);
     } else if (mode == "sub" && argc == 5) {
         asio::co_spawn(ioc, do_sub(ioc, argv[2], std::atol(argv[3]), std::atoi(argv[4])), asio::detached);
+    } else if (mode == "subfield" && argc == 7) {
+        asio::co_spawn(ioc, do_subfield(ioc, argv[2], std::atol(argv[3]), std::atoi(argv[4]),
+                                         argv[5], argv[6]), asio::detached);
     } else if (mode == "ctrl" && argc == 4) {
         asio::co_spawn(ioc, do_ctrl(ioc, argv[2], argv[3]), asio::detached);
     } else {
