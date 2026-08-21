@@ -14,6 +14,10 @@ table and adjust `norm` to match its columns before trusting --verify's
 PASS/FAIL for that table. Publish/consume timing itself has no such
 dependency.
 
+--batch-confirm passes batch_confirm=true to every bmq_consume() call in
+this script (0.5+ only), to compare against the default per-message
+confirm path - see ../README.md's bmq_consume() docs for the tradeoff.
+
 Requires a target queue's BlazingMQ domain to actually hold --limit
 messages: the domain configs BlazingMQ's own docker/single-node/config
 ships (also what test/manage_broker.sh's scratch broker uses) cap
@@ -35,7 +39,10 @@ def main():
     ap.add_argument("--queue-uri", default="bmq://bmq.test.mem.priority/bmq_bench")
     ap.add_argument("--broker-uri", default="tcp://localhost:30114")
     ap.add_argument("--consume-timeout-ms", type=int, default=60000)
+    ap.add_argument("--batch-confirm", action="store_true",
+                     help="pass batch_confirm=true to bmq_consume() (0.5+)")
     args = ap.parse_args()
+    batch_confirm_sql = "true" if args.batch_confirm else "false"
 
     attr_cols = [c.strip() for c in args.attr_columns.split(",")]
     attr_array_sql = "ARRAY[" + ",".join(f"'{c}'" for c in attr_cols) + "]"
@@ -79,7 +86,7 @@ def main():
             avg_bytes, total_bytes = cur.fetchone()
 
             # --- Receive: time a single bmq_consume() pulling everything back ---
-            consume_sql = "SELECT count(*) FROM bmq_consume(%s, NULL, %s, %s)"
+            consume_sql = f"SELECT count(*) FROM bmq_consume(%s, NULL, %s, %s, {batch_confirm_sql})"
             t0 = time.perf_counter()
             cur.execute(consume_sql, (args.queue_uri, args.limit, args.consume_timeout_ms))
             received = cur.fetchone()[0]
@@ -128,7 +135,7 @@ def main():
             cur.execute(
                 "WITH consumed AS ("
                 "  SELECT msgpack_to_jsonb(bmq_consume) AS j"
-                "  FROM bmq_consume(%s, NULL, %s, %s)"
+                f"  FROM bmq_consume(%s, NULL, %s, %s, {batch_confirm_sql})"
                 "), reference AS ("
                 f"  SELECT to_jsonb(t) AS j FROM {base_sql} t"
                 f"), c_grp AS (SELECT {norm} AS j, count(*) c FROM consumed GROUP BY 1),"
