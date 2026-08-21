@@ -168,3 +168,67 @@ this file (broadcast-mode section, batch_confirm section) were not
 controlled this way and may be understating both variants somewhat
 consistently, though the *relative* comparisons in each of those
 sections held up under an immediate same-broker re-test.
+
+## Final, Fully-Controlled Comparison (Supersedes All Numbers Above)
+
+Every number above was measured under a mix of conditions - some with a
+fresh broker restart immediately before, some not, and the NATS/pgnats
+reference number was never re-verified against a freshly restarted
+`nats-server` at all. This section re-runs **every** variant, including
+the NATS reference, with a full fresh process restart (BlazingMQ broker
+or `nats-server`, whichever applies) immediately before each individual
+run, all on the same machine in the same sitting, same 100,000-row
+`nyse_eqy_us_all_trade_20260102` fixture, msgpack, content-verified PASS
+on every run.
+
+| variant | publish rate | receive rate |
+|---|---|---|
+| pg_blazingmq, priority, immediate confirm | 60,851/s | 30,767/s |
+| pg_blazingmq, broadcast, immediate confirm | 60,004/s | 72,744/s |
+| pg_blazingmq, priority, batch_confirm=true | 61,735/s | 54,369/s |
+| pg_blazingmq, broadcast + batch_confirm, with properties | 58,604-59,111/s | 71,981-75,485/s (2 samples) |
+| pg_blazingmq, broadcast + batch_confirm, no properties | 91,144/s | 46,777/s |
+| pgnats / NATS core (fresh `nats-server`) | 93,445-96,415/s | 110,913-110,946/s (2 samples) |
+
+**Two things this controlled re-run corrects, not just confirms**:
+
+1. **Broadcast + batch_confirm together does not measurably beat broadcast
+   alone.** The earlier single-sample 81,623/s for this combination does
+   not reproduce - two fresh-broker samples here land at 71,981/s and
+   75,485/s, both essentially indistinguishable from broadcast-mode alone
+   (72,744/s). `batch_confirm`'s real, reproducible win is specific to
+   *priority* mode (30,653-30,767/s -> 53,428-54,369/s, ~1.75x) - it
+   doesn't compound with broadcast mode, which already removes most of
+   the per-consumer bookkeeping `batch_confirm` is compensating for in
+   priority mode. Treat the earlier 81,623/s figure as sampling noise,
+   not a real effect.
+
+2. **The NATS/pgnats reference number was itself not warmup-controlled,
+   and the effect is not small.** A freshly restarted `nats-server`
+   reproducibly measures **110,913-110,946/s** receive - almost exactly
+   *half* the previously reported 221,868/s. This means the true,
+   controlled gap between pg_blazingmq's best config (broadcast mode,
+   ~72-75k/s) and NATS core is roughly **1.5x**, not the ~2.7-3x implied
+   by comparing against the old, uncontrolled NATS number. Whether this
+   halving is a genuine broker/server warmup effect (symmetric with what
+   was found on the BlazingMQ side) or an artifact of
+   `nats_publish_from_sql.py --verify`'s receive-timing method (it polls
+   `nats_tool`'s periodic stats log at ~1s granularity - both fresh runs
+   here measured "received in 0.901-0.902s", suspiciously close to a
+   single poll interval, which could itself bias the rate calculation)
+   was not isolated here and is worth a follow-up if the exact multiplier
+   matters for a real decision.
+
+The properties-free finding **does** reproduce under this rigor:
+no-properties receive rate (46,777/s) remains well below the matched
+with-properties broadcast+batch_confirm samples (71,981-75,485/s),
+consistent with the original counter-hypothesis result - property
+presence correlates with faster delivery here, not slower, for reasons
+not root-caused (see prior section).
+
+**Bottom line**: pg_blazingmq's best confirmed, reproducible throughput is
+**broadcast mode, ~72-75k/s receive** (batch_confirm adds nothing further
+in broadcast mode; it matters only in priority mode). The real, controlled
+gap to NATS core at its best measured, freshly-restarted rate
+(~110-111k/s) is about **1.5x**, not the far larger gap implied by
+uncontrolled measurements earlier in this document.
