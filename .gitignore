@@ -9,3 +9,4 @@ log/
 test/.broker_scratch/
 bmqbrkr.hist
 bench/__pycache__/
+bench/mq_bench_driver

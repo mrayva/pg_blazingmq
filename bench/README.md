@@ -1431,3 +1431,70 @@ rates aren't comparable to this document's C++-tool numbers elsewhere -
 only the shape across N and the BlazingMQ comparison are the claims.
 Teardown clean: all sidecar/publisher/consumer/`nats-server` processes
 terminated after each configuration, verified via `ps`.
+
+### Re-run with C++ tooling: absolute number confirmed similar at low N, but the scaling shape does not reproduce
+
+Re-ran the identical test (same subject/schema/engine/filter/`--workers 2`,
+100,000 messages, `region` round-robin over 8 values so exactly 12,500
+should match) with a purpose-built C++ client
+(`bench/mq_bench_driver.cpp`, a minimal `nats_asio` + `zerialize` program
+with `pub`/`sub`/`ctrl` modes - no existing tool fit the requirement of
+publishing msgpack `{"region": N}` payloads, since `nats_sidecar` reads
+attributes from the message *body* via `zerialize`, not NATS headers)
+instead of `nats-py`, to check whether the original numbers were limited
+by the Python harness:
+
+| N | publish rate | filtered rate (matches/s) | correctness |
+|---|---|---|---|
+| 1 | 136,628/s | 3,753/s | 12,500/12,500, 0 wrong-region |
+| 2 | 128,123/s | 6,200/s | 12,500/12,500, 0 wrong-region |
+| 4 | 95,684/s | 9,227/s | 12,500/12,500, 0 wrong-region |
+| 8 | 106,832/s | 10,033/s | 12,500/12,500, 0 wrong-region |
+
+**N=1 matches the `nats-py` result closely** (3,753/s vs 3,805/s, within
+1.4%) - confirming the harness wasn't a meaningful bottleneck at low
+concurrency and `nats_sidecar`'s own single-instance filtering throughput
+is genuinely in this range, tool-independent. **But the scaling shape
+does not reproduce past N=2**: this run decelerates (1.65x, 2.46x, 2.67x
+at N=2/4/8) where the `nats-py` run kept accelerating (1.82x, 2.96x,
+6.65x) - so the earlier ~6.65x-at-N=8 finding should not be treated as
+confirmed by this re-run; treat it as unresolved rather than doubly
+verified.
+
+Checked the obvious hypothesis directly rather than guessing: is the
+single downstream consumer process (one connection draining all N
+instances' combined output via a wildcard subscription, msgpack-decoding
+every message to verify `region` synchronously in a single-threaded
+event loop) the new bottleneck? A no-decode variant of the same consumer
+(counts messages, skips the `zerialize` decode/verification entirely)
+measured 9,565/s at N=8 - barely different from the 10,033/s with full
+verification. **This rules out consumer-side decode cost as the
+explanation.** The real cause of the N=8 deceleration in this specific
+harness (single TCP connection/process draining all instances' combined
+output, vs. whatever the original, no-longer-available `nats-py` script
+actually did on its consumer side - possibly multiple connections or a
+different consumption strategy) was not identified further; flagged as
+open, not resolved.
+
+**Conclusion, without overclaiming either direction**: `nats_sidecar`'s
+own single-instance filtering throughput (~3,750/s in this configuration)
+is confirmed, tool-independently, at N=1. That multiple instances under
+one queue group scale *filtered* throughput at all is still true (N=2
+and N=4 both show real gains over N=1 in both runs). But the specific
+magnitude of scaling at higher N, and whether it keeps accelerating or
+decelerates, is genuinely unresolved between these two runs - the
+original `nats-py` harness's own consumer-side implementation was never
+committed and can't be inspected to explain the discrepancy, and this
+run's own single-consumer-process design is a real, acknowledged
+limitation (rather than a proven statement about `nats_sidecar`'s true
+ceiling) that whoever revisits this should account for - e.g. a
+multi-connection or multi-process downstream consumer, to rule out the
+consumer itself being the structural limit at higher N.
+
+New tooling: `bench/mq_bench_driver.cpp` (`pub`/`sub`/`ctrl` modes,
+build command in a header comment) and
+`bench/nats_sidecar_scaling_cpp.py` (the N-sweep orchestrator, using
+`subprocess.Popen`/`.terminate()` directly rather than `pkill`, matching
+the lesson from an earlier fork's teardown bug in this environment).
+Teardown confirmed clean via `ps` after every run, including the ad hoc
+no-decode diagnostic.
