@@ -861,26 +861,64 @@ eventually drain given enough tail time in this specific test, but its
 steady-state window was clearly growing, not flat - not a rate that
 holds indefinitely).
 
-**A genuinely surprising negative result, flagged rather than
-explained:** 2 consumers at a higher target rate (80,000/s) sustained
-only ~2,933/s - *worse* than 1 consumer alone managed at a lower,
-still-unsustainable 48,000/s target (29,114/s). More consumer capacity
-made things worse, not better. Not root-caused here (plausibly
-round-robin fan-out coordination overhead among multiple attached
-consumers scaling poorly with consumer count, independent of dispatcher
-thread pool availability - all runs in this section used pools sized
-generously at 8 for at most 3 concurrent sessions, so pool size isn't the
-limiter) - real scope for whoever picks this up next.
+**The 2-consumer regression, now root-caused: it's not multi-consumer
+drain capacity, it's live-publish interaction.** A follow-up isolated the
+two things that were tangled together in the result above: consumer
+*drain capacity in isolation* (a fixed pre-published backlog, no producer
+running at all) versus consumer performance *while a producer is
+concurrently publishing*, using a standalone diagnostic
+(`bmqbrkr.tsk` fresh each time, 300-400k row backlogs, `perf record -g`
+attached to the broker during the drain):
 
-**Practical implication, revised from the section above**: it's not just
-"consume promptly instead of letting a backlog build" - it's that
-*sizing your producer rate to what your actual consumer capacity can
-sustain* is the real requirement, since BlazingMQ (at least in this
-single-node, in-memory, priority-mode configuration) has no stable
-equilibrium once publish outpaces drain capacity even briefly. ~42-45k/s
-is the number to design around for this configuration, not the ~500k/s
-burst ceiling found earlier - and multi-consumer scaling is not a safe
-assumption for raising that number without further investigation.
+| scenario | consumers | rate |
+|---|---|---|
+| isolated drain (no live producer), pre-published backlog | 1 | 223,339/s |
+| isolated drain (no live producer), pre-published backlog | 2 | 58,221-77,104/s |
+| isolated drain (no live producer), pre-published backlog | 4 | 49,327/s |
+| **live** publish+drain, target 42,000/s (1 producer's own sustainable rate) | 2 | **3,999/s** |
+| **live** publish+drain, target 50,000/s | 2 | 10,773/s (jumps to full drain speed the instant the producer stops) |
+
+Isolated 2-consumer drain is genuinely fine - slower than 1 consumer
+per-consumer (consistent with round-robin coordination overhead scaling
+with consumer count, confirmed via `perf`: no single dominant lock/
+contention symbol, just broadly higher confirm/delivery/stats-tracking
+cost spread across many functions, all under 5% individually), but still
+a healthy 58-77k/s in absolute terms. The catastrophic collapse only
+happens with a **live, concurrently-publishing producer in the picture**:
+at the exact rate (42,000/s) that 1 consumer sustains cleanly with a
+shrinking backlog, adding a second consumer instead grows the backlog to
+440k+ and drains at a crawl even during the drain-tail (after the
+producer has stopped) - nothing like the isolated test's 58-77k/s. The
+50,000/s run shows the mechanism directly: consume rate is throttled to
+~10,773/s the entire time the producer is live, then jumps to full speed
+the moment publishing stops. Combined with the already-established
+finding that publish cost itself scales with backlog size
+(`RootQueueEngine::afterNewMessage()`/`deliverMessage()`), this points to
+a shared-dispatcher-thread-pool contention loop: a live producer's own
+per-message dispatch work competes with confirm-handling dispatch work on
+the *same* thread pools, round-robin's per-message consumer-selection
+adds cost specifically during live interleaved delivery (not needed for
+a bulk pre-published backlog), and any backlog growth from that
+contention makes the producer's own next publish more expensive too -
+self-reinforcing, matching the pattern already documented above.
+
+**Practical implication, and the actual answer to "can consumers help":
+no, not by adding more of them.** Isolated drain capacity being healthy
+doesn't matter if it can't be reached under live production load, and
+this test found the opposite of what more consumers is supposed to buy
+you - the live 2-consumer number was consistently *worse* than the clean
+1-consumer number at the same target rate, not better. **1 consumer,
+priority mode, ~42,000-45,000/s remains the best-known, most trustworthy
+sustained rate for this configuration** - not because multi-consumer
+drain is inherently slow (it isn't, in isolation), but because the
+interaction between live publish and multi-consumer round-robin delivery
+is actively harmful, not helpful, and isn't something client-side
+consumer count or `bmq_consume()` batch/timeout tuning can fix on its
+own. Real remaining scope for whoever picks this up: profile the *live*
+2-consumer case directly (not the isolated drain) to find the specific
+contention point, and check whether `channelHighWatermark`/dispatcher
+pool sizing tuned specifically for the producer+consumer mix (not just
+total session count) changes this - neither was reached here.
 
 New reusable script: `bench/sustained_bench.py`. Domain/broker config
 changes made and reverted the same way as every other run in this
