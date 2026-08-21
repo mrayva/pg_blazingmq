@@ -369,3 +369,58 @@ revisiting if this ever becomes a decision that matters for a real
 deployment, but for benchmarking purposes: **leave `allocatorType` at its
 shipped `STACKTRACETEST` default** - every number in this document already
 does, and that turns out to be the right call, not a confound to fix.
+
+## Attempted: NATS JetStream Comparison (Blocked - Not A Result)
+
+The core-NATS comparison above was invalidated (see "The NATS receive
+rate was never real") because the consumer was already caught up
+concurrently with publish - no real backlog to drain, unlike
+`bmq_consume()`'s genuine "pull an already-persisted backlog" shape.
+JetStream is the correct fix for that mismatch (it persists regardless of
+consumer timing), so the plan was: publish 100,000 rows via
+`nats_publish_from_sql.py --jetstream --jetstream-async` (no `--verify`,
+so no concurrent consumer), then *after* publish fully completes, drain
+the stream from scratch via `nats_tool js_grub`, timing the drain by
+polling its `--dump` file's line count at 10ms resolution (the same
+technique that correctly measured pg_blazingmq's drain rate and exposed
+the core-NATS stats-timer artifact) rather than trusting `nats_tool`'s
+whole-second stats log.
+
+**Blocked before a single valid number was produced**: the publish step
+reports success cleanly - `nats_publish_from_sql.py` prints "stream
+ready" and a real-looking throughput figure (217,797/s and 251,451/s
+across two attempts, different stream/subject names each time) - but the
+stream **never actually exists afterward**. Checked directly against
+`nats-server`'s own monitoring API (`curl localhost:8222/jsz?
+streams=true`, confirmed only one `nats-server` process/account is
+running, not a routing/port mismatch), immediately after publish and
+again after a 2s wait: only the 7 pre-existing streams from unrelated
+earlier sessions show up (`PGNATS_PUB_BENCH`, `KV_PGNATS_PC_3M`, etc.) -
+neither `JSCMP_MSGPACK_*` nor `JSCMP2_MSGPACK_*` is ever present.
+Reproduced twice with different stream/subject-prefix names, ruling out
+a name collision or leftover-state explanation.
+
+**Best diagnosis, not confirmed**: `nats_publish_binary_stream_async()`
+returns immediately without waiting for a per-message ack, by design -
+`nats_publish_stream_flush()` is what's supposed to verify every queued
+ack actually landed. This script's own docstring notes that pgnats
+versions before 1.1.1 had exactly this class of bug elsewhere -
+`nats_publish_binary_stream()`'s *blocking* variant "silently discarded a
+message's ack instead of checking it - a failed or timed-out JetStream
+publish was never surfaced as an error." The currently-installed pgnats
+is 1.1.4, past that fix for the blocking path, but the *async*
+flush-verification path (`nats_publish_stream_flush()`) was not
+independently checked here and is a plausible place for an analogous
+unchecked-failure bug to still exist. Not verified against pgnats's C
+source - would need someone to actually read/instrument
+`nats_publish_stream_flush()`'s implementation to confirm.
+
+**No JetStream-vs-pg_blazingmq numbers are reported because none were
+obtained that could be trusted** - reporting a "publish rate" for
+messages that provably never persisted would repeat exactly the kind of
+mistake the rest of this document has spent effort undoing. If this
+comparison is revisited: instrument or debug `nats_publish_stream_flush()`
+directly, or sidestep pgnats's stream-publish path entirely and drive
+`nats_tool`'s own `pub --js` mode directly from a shell script instead of
+through the Postgres extension layer, to isolate whether the bug is in
+pgnats's SQL-callable wrapper or somewhere lower in the stack.
