@@ -58,17 +58,40 @@ runs, or keep `--limit` under the configured ceiling.
 
 ## Sample Result (100,000 rows, `nyse_eqy_us_all_trade_20260102`, msgpack, single machine)
 
-| system                    | rows    | avg bytes | publish rate | receive rate |
-|---------------------------|---------|-----------|---------------|---------------|
-| pg_blazingmq (BlazingMQ)  | 100,000 | 357B      | 58,319/s      | 30,653/s      |
-| pgnats (NATS core)        | 100,000 | 356B      | 69,925/s      | 221,868/s     |
+| system                          | rows    | avg bytes | publish rate | receive rate |
+|----------------------------------|---------|-----------|---------------|---------------|
+| pg_blazingmq (BlazingMQ, priority)  | 100,000 | 357B      | 58,319/s      | 30,653/s      |
+| pg_blazingmq (BlazingMQ, broadcast) | 100,000 | 356B      | 57,755/s      | 73,294/s      |
+| pgnats (NATS core)               | 100,000 | 356B      | 69,925/s      | 221,868/s     |
 
-NATS core publishes somewhat faster and receives markedly faster than
-BlazingMQ here - expected given the structural difference: NATS core has
-no persistence or delivery guarantee (fire-and-forget, no per-message ack),
-while BlazingMQ's queue is a persisted, at-least-once priority queue with
-real per-message confirmation (`session.confirmMessage()`) and broker-side
-storage accounting on every publish. That's the tradeoff `pg_blazingmq`
-is for: durability and BlazingMQ's own server-side subscription filtering
-(`bmqeval`), not raw throughput parity with a fire-and-forget core pub/sub
-system.
+Both `bmq.test.mem.priority` and `bmq.test.mem.broadcast` (this domain's
+own config, `docker/single-node/config/domains/bmq.test.mem.broadcast.json`
+in the BlazingMQ checkout) use `inMemory` storage and `eventual`
+consistency - so this is **not** a persisted-vs-non-persisted comparison;
+both BlazingMQ modes here are already non-durable, same as NATS core.
+
+Switching from priority mode to broadcast mode (fire-and-forget best-effort
+fan-out, no per-consumer positional backlog tracking) left publish rate
+essentially unchanged (~58k/s either way - publish-side cost is dominated
+by encoding and the publish protocol itself, not consumer-side bookkeeping)
+but raised receive rate ~2.4x (30,653/s -> 73,294/s). That confirms
+priority mode's per-consumer positional queue bookkeeping was a real,
+measurable contributor to the original gap - but a large gap to NATS
+core's 221,868/s receive rate remains even under broadcast mode. The
+likely remaining driver is BlazingMQ's per-message application-level
+acknowledgment protocol (`session.confirmMessage()`, still required in
+both queue modes for at-least-once semantics) plus general wire-protocol
+and broker-side richness (subscription property evaluation via `bmqeval`,
+watermark/limit accounting) that NATS core's minimal fire-and-forget
+protocol simply doesn't do. That's the real tradeoff `pg_blazingmq` is
+for - durability options and BlazingMQ's own server-side subscription
+filtering - not raw throughput parity with a minimal core pub/sub system.
+
+(Broadcast-mode queues only deliver to consumers already connected at
+publish time, unlike priority mode's queued pull-consumption for
+not-yet-connected readers - this benchmark's single-session, one-handle-
+per-queue-URI design in `pg_blazingmq` already opens the queue with
+combined read+write flags on the very first `bmq_publish_row()` call, so
+the read side is established before any message is published and this
+script needed no changes to work correctly under broadcast mode; verified
+via a 50-row dry run before the full 100k run.)
