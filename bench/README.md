@@ -60,8 +60,9 @@ runs, or keep `--limit` under the configured ceiling.
 
 | system                          | rows    | avg bytes | publish rate | receive rate |
 |----------------------------------|---------|-----------|---------------|---------------|
-| pg_blazingmq (BlazingMQ, priority)  | 100,000 | 357B      | 58,319/s      | 30,653/s      |
-| pg_blazingmq (BlazingMQ, broadcast) | 100,000 | 356B      | 57,755/s      | 73,294/s      |
+| pg_blazingmq (BlazingMQ, priority, immediate confirm)  | 100,000 | 357B      | 58,319/s      | 30,653/s      |
+| pg_blazingmq (BlazingMQ, priority, batch_confirm=true) | 100,000 | 355B      | 60,741/s      | 53,428/s      |
+| pg_blazingmq (BlazingMQ, broadcast, immediate confirm) | 100,000 | 356B      | 57,755/s      | 73,294/s      |
 | pgnats (NATS core)               | 100,000 | 356B      | 69,925/s      | 221,868/s     |
 
 Both `bmq.test.mem.priority` and `bmq.test.mem.broadcast` (this domain's
@@ -76,13 +77,36 @@ essentially unchanged (~58k/s either way - publish-side cost is dominated
 by encoding and the publish protocol itself, not consumer-side bookkeeping)
 but raised receive rate ~2.4x (30,653/s -> 73,294/s). That confirms
 priority mode's per-consumer positional queue bookkeeping was a real,
-measurable contributor to the original gap - but a large gap to NATS
-core's 221,868/s receive rate remains even under broadcast mode. The
-likely remaining driver is BlazingMQ's per-message application-level
-acknowledgment protocol (`session.confirmMessage()`, still required in
-both queue modes for at-least-once semantics) plus general wire-protocol
-and broker-side richness (subscription property evaluation via `bmqeval`,
-watermark/limit accounting) that NATS core's minimal fire-and-forget
+measurable contributor to the original gap.
+
+Confirming per message is *not* actually mandatory - `confirmMessage()` is
+documented as asynchronous, and BlazingMQ has a real batch API
+(`bmqa::ConfirmEventBuilder` / `session.confirmMessages()`) built exactly
+for this. `bmq_consume(..., batch_confirm => true)` (0.5+) uses it, and on
+the same priority-mode queue it very nearly closed the broadcast-mode gap
+without changing queue mode at all: 30,653/s -> 53,428/s, a ~1.75x
+improvement from batching alone. That isolates immediate-per-message
+confirmation as the single largest driver of the original priority-mode
+gap - bigger than the queue-mode bookkeeping difference above.
+
+**A real gotcha this uncovered**: naively deferring *every* confirm to one
+flush at the very end of a large pull doesn't just underperform, it
+deadlocks. BlazingMQ's broker enforces a default per-consumer flow-control
+window (`bmqt::QueueOptions::k_DEFAULT_MAX_UNCONFIRMED_MESSAGES = 1000`) -
+once that many messages are outstanding unconfirmed, it stops sending more
+until some are confirmed. A first implementation that confirmed only after
+the whole receive loop finished stalled permanently at exactly 1000
+messages on a `max_messages` pull larger than that, because nothing ever
+confirmed anything to reopen the window. Fixed by flushing the batch
+periodically (every `kBatchConfirmFlushThreshold = 500` messages, in
+`pg_blazingmq.cpp`) - comfortably under the default window - not just at
+the end.
+
+Even with batching, a real gap to NATS core's 221,868/s receive rate
+remains. The likely remaining driver is general wire-protocol and
+broker-side richness (subscription property evaluation via `bmqeval`,
+watermark/limit accounting, the CONFIRM protocol messages themselves -
+still sent, just batched) that NATS core's minimal fire-and-forget
 protocol simply doesn't do. That's the real tradeoff `pg_blazingmq` is
 for - durability options and BlazingMQ's own server-side subscription
 filtering - not raw throughput parity with a minimal core pub/sub system.
