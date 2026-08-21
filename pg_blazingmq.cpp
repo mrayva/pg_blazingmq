@@ -22,6 +22,9 @@ extern "C" {
 #include "access/htup_details.h"
 #include "access/tupdesc.h"
 #include "storage/ipc.h"
+#include "utils/tuplestore.h"
+#include "nodes/execnodes.h"
+#include "miscadmin.h"
 #include "varatt.h"
 
 #ifdef PG_MODULE_MAGIC
@@ -34,18 +37,29 @@ void _PG_init(void);
 #include <bmqa_session.h>
 #include <bmqa_queueid.h>
 #include <bmqa_openqueuestatus.h>
+#include <bmqa_configurequeuestatus.h>
 #include <bmqa_messageeventbuilder.h>
 #include <bmqa_message.h>
 #include <bmqa_messageproperties.h>
+#include <bmqa_event.h>
+#include <bmqa_messageevent.h>
+#include <bmqa_messageiterator.h>
 #include <bmqt_sessionoptions.h>
 #include <bmqt_uri.h>
 #include <bmqt_queueflags.h>
+#include <bmqt_queueoptions.h>
+#include <bmqt_subscription.h>
+#include <bmqt_correlationid.h>
+#include <bmqt_messageeventtype.h>
 #include <bsls_timeinterval.h>
+#include <bdlbb_blob.h>
+#include <bdlbb_blobutil.h>
 
 #include <zerialize/zerialize.hpp>
 #include <zerialize/dynamic.hpp>
 #include <zerialize/protocols/msgpack.hpp>
 
+#include <chrono>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -58,6 +72,7 @@ namespace z = zerialize;
 namespace bmqa = BloombergLP::bmqa;
 namespace bmqt = BloombergLP::bmqt;
 namespace bsls = BloombergLP::bsls;
+namespace bdlbb = BloombergLP::bdlbb;
 
 // --- GUC -------------------------------------------------------------------
 
@@ -83,15 +98,34 @@ void _PG_init(void)
 // the backend - BlazingMQ owns queue existence/state server-side, so this
 // is purely a local handle cache, not something that needs rebuilding.
 
+// BlazingMQ allows only one open handle per (session, queue URI) at all -
+// discovered the hard way: opening the same URI a second time from the
+// same session, even with different flags (e.g. WRITE then READ), fails
+// with ALREADY_OPENED. So there is exactly one queue-handle cache, not
+// separate read/write ones: every handle is opened with combined
+// e_READ | e_WRITE flags regardless of which entry point (publish or
+// consume) touches a given URI first, so either direction can follow.
+//
+// The subscription expression (if any) is fixed at open time, so the
+// cache also remembers which expression each handle was opened with.
+// Calling bmq_consume() again on the same URI with a *different*
+// expression from the same backend is a clear error rather than silently
+// reusing the old filter or paying for a reconfigure round-trip; this is
+// a documented first-cut limitation, not a fundamental one.
+struct QueueEntry {
+    bmqa::QueueId queueId;
+    std::string subscriptionExpr; // empty if opened without one
+};
+
 static bmqa::Session* g_session = nullptr;
-static std::unordered_map<std::string, bmqa::QueueId>* g_write_queues = nullptr;
+static std::unordered_map<std::string, QueueEntry>* g_queues = nullptr;
 static bool g_exit_hook_registered = false;
 
 static void pg_blazingmq_exit_hook(int /*code*/, Datum /*arg*/)
 {
-    if (g_write_queues) {
-        delete g_write_queues;
-        g_write_queues = nullptr;
+    if (g_queues) {
+        delete g_queues;
+        g_queues = nullptr;
     }
     if (g_session) {
         g_session->stop();
@@ -123,27 +157,71 @@ static bmqa::Session& get_session()
     return *g_session;
 }
 
-static bmqa::QueueId& get_write_queue(bmqa::Session& session, const std::string& uri)
+static bmqt::QueueOptions build_queue_options(const std::string& subscriptionExpr)
 {
-    if (!g_write_queues) {
-        g_write_queues = new std::unordered_map<std::string, bmqa::QueueId>();
+    bmqt::QueueOptions queueOptions;
+    if (!subscriptionExpr.empty()) {
+        bmqt::Subscription sub;
+        sub.setExpression(bmqt::SubscriptionExpression(
+            subscriptionExpr, bmqt::SubscriptionExpression::e_VERSION_1));
+        bmqt::SubscriptionHandle handle(bmqt::CorrelationId::autoValue());
+        bsl::string err;
+        if (!queueOptions.addOrUpdateSubscription(&err, handle, sub)) {
+            throw std::runtime_error(
+                "invalid subscription_expr '" + subscriptionExpr + "': " +
+                std::string(err.c_str()));
+        }
+    }
+    return queueOptions;
+}
+
+// subscriptionExpr is only meaningful for the read side; pass "" from the
+// publish path, which doesn't have one. If a URI already has a cached
+// handle open with a *different* subscription_expr, the handle is
+// reconfigured (BlazingMQ's own addOrUpdateSubscription semantics) rather
+// than erroring - this is what makes "publish, then consume with a
+// filter" work within one backend/session, since BlazingMQ only allows
+// one open handle per (session, queue URI) at all, discovered the hard
+// way (ALREADY_OPENED trying to open the same URI twice with different
+// flags). An empty subscriptionExpr request never triggers a
+// reconfigure - it just reuses whatever's already there.
+static bmqa::QueueId& get_queue(
+    bmqa::Session& session, const std::string& uri, const std::string& subscriptionExpr)
+{
+    if (!g_queues) {
+        g_queues = new std::unordered_map<std::string, QueueEntry>();
     }
 
-    auto it = g_write_queues->find(uri);
-    if (it != g_write_queues->end()) return it->second;
+    auto it = g_queues->find(uri);
+    if (it != g_queues->end()) {
+        if (!subscriptionExpr.empty() && it->second.subscriptionExpr != subscriptionExpr) {
+            bmqa::ConfigureQueueStatus status = session.configureQueueSync(
+                &it->second.queueId, build_queue_options(subscriptionExpr));
+            if (status.result() != bmqt::ConfigureQueueResult::e_SUCCESS) {
+                std::ostringstream err;
+                err << "failed to reconfigure BlazingMQ queue '" << uri
+                    << "' with subscription_expr '" << subscriptionExpr << "': " << status;
+                throw std::runtime_error(err.str());
+            }
+            it->second.subscriptionExpr = subscriptionExpr;
+        }
+        return it->second.queueId;
+    }
 
     bmqa::QueueId queueId;
+    bsls::Types::Uint64 flags = bmqt::QueueFlags::e_READ | bmqt::QueueFlags::e_WRITE;
     bmqa::OpenQueueStatus status = session.openQueueSync(
-        &queueId, bmqt::Uri(uri.c_str()), bmqt::QueueFlags::e_WRITE);
+        &queueId, bmqt::Uri(uri.c_str()), flags, build_queue_options(subscriptionExpr));
     if (status.result() != bmqt::OpenQueueResult::e_SUCCESS) {
         std::ostringstream err;
-        err << "failed to open BlazingMQ queue '" << uri << "' for writing: " << status;
+        err << "failed to open BlazingMQ queue '" << uri << "': " << status;
         throw std::runtime_error(err.str());
     }
 
-    auto [inserted_it, inserted] = g_write_queues->emplace(uri, queueId);
+    auto [inserted_it, inserted] = g_queues->emplace(
+        uri, QueueEntry{queueId, subscriptionExpr});
     (void)inserted;
-    return inserted_it->second;
+    return inserted_it->second.queueId;
 }
 
 // --- Row -> {payload, properties} ------------------------------------------
@@ -323,7 +401,7 @@ Datum bmq_publish_row(PG_FUNCTION_ARGS)
         z::ZBuffer payload = z::serialize<z::MsgPack>(z::dyn::Value::map(std::move(row_map)));
 
         bmqa::Session& session = get_session();
-        bmqa::QueueId& queueId = get_write_queue(session, queue_uri);
+        bmqa::QueueId& queueId = get_queue(session, queue_uri, "");
 
         bmqa::MessageEventBuilder builder;
         session.loadMessageEventBuilder(&builder);
@@ -363,6 +441,102 @@ Datum bmq_publish_row(PG_FUNCTION_ARGS)
 
     ReleaseTupleDesc(tupdesc);
     PG_RETURN_VOID();
+}
+
+PG_FUNCTION_INFO_V1(bmq_consume);
+
+Datum bmq_consume(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0)) ereport(ERROR, (errmsg("queue_uri must not be null")));
+
+    text* queue_uri_text = PG_GETARG_TEXT_PP(0);
+    std::string queue_uri(VARDATA_ANY(queue_uri_text), VARSIZE_ANY_EXHDR(queue_uri_text));
+
+    std::string subscription_expr;
+    if (!PG_ARGISNULL(1)) {
+        text* t = PG_GETARG_TEXT_PP(1);
+        subscription_expr.assign(VARDATA_ANY(t), VARSIZE_ANY_EXHDR(t));
+    }
+
+    int32 max_messages = PG_ARGISNULL(2) ? 1 : PG_GETARG_INT32(2);
+    int32 timeout_ms = PG_ARGISNULL(3) ? 1000 : PG_GETARG_INT32(3);
+    if (max_messages < 1) ereport(ERROR, (errmsg("max_messages must be >= 1")));
+    if (timeout_ms < 0) ereport(ERROR, (errmsg("timeout_ms must be >= 0")));
+
+    ReturnSetInfo* rsinfo = (ReturnSetInfo*) fcinfo->resultinfo;
+    if (!rsinfo || !(rsinfo->allowedModes & SFRM_Materialize)) {
+        ereport(ERROR, (errmsg("bmq_consume called in a context that cannot accept a set")));
+    }
+    rsinfo->returnMode = SFRM_Materialize;
+
+    MemoryContext oldcontext = MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
+    Tuplestorestate* tupstore = tuplestore_begin_heap(false, false, work_mem);
+    TupleDesc tupdesc = CreateTemplateTupleDesc(1);
+    TupleDescInitEntry(tupdesc, (AttrNumber) 1, "payload", BYTEAOID, -1, 0);
+    rsinfo->setResult = tupstore;
+    rsinfo->setDesc = tupdesc;
+    MemoryContextSwitchTo(oldcontext);
+
+    try {
+        bmqa::Session& session = get_session();
+        bmqa::QueueId& queueId = get_queue(session, queue_uri, subscription_expr);
+
+        auto deadline = std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(timeout_ms);
+        int32 received = 0;
+
+        while (received < max_messages) {
+            auto remaining = deadline - std::chrono::steady_clock::now();
+            auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(remaining).count();
+            if (remaining_ms <= 0) break;
+
+            bmqa::Event event = session.nextEvent(
+                bsls::TimeInterval(static_cast<double>(remaining_ms) / 1000.0));
+
+            if (!event.isMessageEvent()) continue; // session/timeout/other event - keep polling
+
+            bmqa::MessageEvent msgEvent = event.messageEvent();
+            if (msgEvent.type() != bmqt::MessageEventType::e_PUSH) continue;
+
+            bmqa::MessageIterator msgIter = msgEvent.messageIterator();
+            while (msgIter.nextMessage() && received < max_messages) {
+                const bmqa::Message& msg = msgIter.message();
+
+                int dataSize = msg.dataSize();
+                bytea* result = (bytea*) palloc(VARHDRSZ + dataSize);
+                SET_VARSIZE(result, VARHDRSZ + dataSize);
+                if (dataSize > 0) {
+                    bdlbb::Blob blob;
+                    msg.getData(&blob);
+                    bdlbb::BlobUtil::copy(VARDATA(result), blob, 0, dataSize);
+                }
+
+                Datum values[1] = {PointerGetDatum(result)};
+                bool nulls[1] = {false};
+                tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+                ++received;
+
+                int confirm_rc = session.confirmMessage(msg);
+                if (confirm_rc != 0) {
+                    ereport(WARNING,
+                            (errmsg("failed to confirm BlazingMQ message on queue '%s' (rc=%d)",
+                                    queue_uri.c_str(), confirm_rc)));
+                }
+            }
+            (void)queueId;
+        }
+    } catch (const std::exception& ex) {
+        ereport(ERROR,
+                (errcode(ERRCODE_CONNECTION_EXCEPTION),
+                 errmsg("bmq_consume failed"),
+                 errdetail("%s", ex.what())));
+    } catch (...) {
+        ereport(ERROR,
+                (errcode(ERRCODE_CONNECTION_EXCEPTION),
+                 errmsg("bmq_consume failed with unknown exception")));
+    }
+
+    return (Datum) 0;
 }
 
 } // extern "C"

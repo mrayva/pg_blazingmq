@@ -14,7 +14,7 @@ Postgres rows speak that: promote chosen columns to typed message properties
 float/double type, and no list-membership operator in its expression
 grammar), and pack the full row as the message payload via `pg_zerialize`.
 
-## Status: Phase 2 (publish path)
+## Status: Phase 3 (pull-consume)
 
 `pg_blazingmq_link_check()` (Phase 1) constructs a real `bmqa::Session`
 (without calling `start()`, so no live broker is needed) to prove the
@@ -31,10 +31,34 @@ can be attributes - naming an ineligible column (e.g. a `float8`) is a
 clear error, raised before any network call. If `attr_columns` is omitted,
 every eligible column is promoted automatically.
 
+`bmq_consume(queue_uri, subscription_expr, max_messages, timeout_ms)`
+(Phase 3) synchronously pulls up to `max_messages` payloads, waiting up to
+`timeout_ms` total. Each received message is confirmed immediately - no
+separate ack step in this first cut. `subscription_expr`, if given, is
+BlazingMQ's own `bmqeval` expression, applied server-side: only matching
+messages are delivered to this handle at all.
+
 The session is held per-backend (lazily started on first use, stopped via
-`on_proc_exit`); queue write-handles are cached per URI for the backend's
-lifetime. Broker address is `blazingmq.broker_uri` (GUC, defaults to
-`tcp://localhost:30114`).
+`on_proc_exit`). Queue handles are cached per URI for the backend's
+lifetime - **one handle per (session, queue URI), always opened with
+combined READ+WRITE flags**, discovered the hard way: BlazingMQ rejects
+opening the same URI twice from one session even with different flags
+(`ALREADY_OPENED`), so publish and consume against the same queue in the
+same backend must share one handle. If a later `bmq_consume()` call asks
+for a different `subscription_expr` than the cached handle currently has,
+the handle is reconfigured in place (`configureQueueSync`) rather than
+erroring - this is what makes "publish, then consume with a filter" work
+within one session. Broker address is `blazingmq.broker_uri` (GUC,
+defaults to `tcp://localhost:30114`).
+
+**Important semantic to know**: BlazingMQ evaluates a subscription's
+filter at message-*arrival* time against whatever handles/filters are
+active *then* - it is not retroactive. If you reconfigure (or open) a
+filtered read handle *after* messages have already been published to that
+queue, those already-published messages were queued for delivery under
+the *old* filter and will still arrive unfiltered. Establish the
+subscription you want before publishing the messages you want filtered by
+it, not after.
 
 ```sql
 CREATE EXTENSION pg_blazingmq;
@@ -44,13 +68,22 @@ SELECT pg_blazingmq_link_check('tcp://localhost:30114');
 --  pg_blazingmq link OK: brokerUri=tcp://localhost:30114 numProcessingThreads=1
 
 CREATE TABLE trades (region int, symbol text, price float8, active bool);
-INSERT INTO trades VALUES (1, 'AAPL', 150.25, true);
+INSERT INTO trades VALUES (1, 'AAPL', 150.25, true), (2, 'MSFT', 305.5, false);
 
 SET blazingmq.broker_uri = 'tcp://localhost:30114';
+
+-- Establish the filter before publishing (see semantic note above).
+SELECT count(*) FROM bmq_consume('bmq://bmq.test.priority/trades', 'region == 1', 5, 500);
+
 SELECT bmq_publish_row('bmq://bmq.test.priority/trades', trades, ARRAY['region'])
 FROM trades;
--- delivered payload (msgpack): {region: 1, symbol: "AAPL", price: 150.25, active: true}
--- delivered properties:        region (INT32) = 1  -- subscribers can filter on "region == 1"
+
+SELECT msgpack_to_jsonb(bmq_consume)  -- pg_zerialize decodes the payload
+FROM bmq_consume('bmq://bmq.test.priority/trades', 'region == 1', 5, 3000);
+--                         msgpack_to_jsonb
+-- ------------------------------------------------------------------
+--  {"price": 150.25, "active": true, "region": 1, "symbol": "AAPL"}
+-- (only region=1 delivered - MSFT/region=2 was correctly filtered out)
 ```
 
 ## Building
@@ -110,7 +143,8 @@ See the project's own notes for the full phased plan:
    BDE/NTF/bmq client stack.
 2. **Publish path** (done) - `bmq_publish_row(queue_uri, row_data,
    attr_columns)`: column→property mapping, zerialize-packed payload.
-3. **Pull-consume** - `bmq_consume(queue_uri, subscription_expr, ...)`.
+3. **Pull-consume** (done) - `bmq_consume(queue_uri, subscription_expr,
+   max_messages, timeout_ms)`.
 4. **Push-consume** - background worker + SPI callback dispatch, mirroring
    `pgnats`'s `nats_subscribe(subject, fn_oid)`.
 5. **Tests** - `pg_regress` suite against a real single-node broker.
