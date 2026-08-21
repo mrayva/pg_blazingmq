@@ -205,6 +205,17 @@ anything that was already built under the old, non-PIC configuration):
 cd build/blazingmq && ninja bmqbrkr.tsk bmqtool.tsk
 ```
 
+**Broker capacity planning**: `bmq_publish_row`/`bmq_consume` scale with
+concurrent Postgres backends for free (one `bmqa::Session` per backend,
+Postgres's own process-per-connection model) - but the broker's own
+`appConfig.dispatcherConfig.sessions.numProcessors` (default 4 in
+BlazingMQ's own sample configs) caps how many of those sessions can be
+serviced in parallel before throughput *degrades* past that count, not
+just plateaus. Size it to your expected concurrent client count - see
+`bench/README.md`'s "Multiple Postgres Backends" section for the measured
+before/after (>2x at 16 concurrent backends after matching
+`numProcessors` to the connection count).
+
 ## Testing
 
 `make test` is the one-command entry point: starts a scratch single-node

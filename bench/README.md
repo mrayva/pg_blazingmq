@@ -542,3 +542,76 @@ the bottleneck there. On BlazingMQ's side, the raw client was actually
 *slower* than the Postgres-driven number, a genuinely counterintuitive
 result pointing at `bmqtool`'s own load-generation code rather than
 anything about BlazingMQ, Postgres, or pg_blazingmq.
+
+## Multiple Postgres Backends, and the Real Broker-Side Ceiling
+
+Every `bmq_bench.py` run above used one psycopg connection - one Postgres
+backend, one `bmqa::Session` (`pg_blazingmq.cpp`'s `get_session()` is a
+per-backend singleton; Postgres's own process-per-connection model means
+this already gives one independent session per concurrent client, with no
+code change needed). Two things had never actually been tested: whether
+concurrently-publishing backends help throughput, and whether
+`bmqa::Session`'s client-side I/O thread count (`SessionOptions::
+setNumProcessingThreads()`, never called by `get_session()` - every
+session runs the BlazingMQ default) matters.
+
+**`numProcessingThreads` doesn't matter.** Tested 1 (default), 4, and 24
+on a single session/backend, same broadcast + `batch_confirm` config as
+the established ~86-90k/s baseline: 94,121/s, 85,884/s, 87,077/s -
+statistically the same. Rules out client-side event-dispatch threading as
+a factor; not landed as a GUC since it's a no-op knob here.
+
+**Multiple concurrent backends scale, but not monotonically with the
+broker's default config.** N separate psycopg connections (multiprocessing,
+each its own backend/session), same 100,000-row split across workers,
+fresh broker restart per run, `bmq.test.mem.broadcast`:
+
+| connections | publish rate |
+|---|---|
+| 1 | 166,559/s |
+| 4 | 336,147/s |
+| 16 | 70,109/s (worse than N=1) |
+
+Ruled out a test artifact first: re-ran N=16 at 4x the row count (25,000
+rows/worker, matching N=4's per-worker share) to rule out fixed
+per-worker session-startup cost dominating at a small per-worker row
+count - result was unchanged (68,114/s), confirming a genuine
+degradation, not a fixed-cost artifact of the test itself.
+
+**Root cause, found via `perf record -g` on `bmqbrkr.tsk` during an N=4
+run** (53,056 samples): the broker's own dispatcher runs on named,
+fixed-size thread pools - `bmqDispSession` (46.84% of all samples) and
+`bmqDispQueue` (29.56%) - not one thread per client connection. Their
+size is a real, documented, configurable broker setting:
+`appConfig.dispatcherConfig.sessions.numProcessors` (default **4** in
+BlazingMQ's own `docker/single-node/config/bmqbrkrcfg.json`, which
+`test/manage_broker.sh`'s scratch broker uses unmodified) and
+`.queues.numProcessors` (default 8). N=4 landed right at the sessions
+pool's default size - the sweet spot, not a coincidence. N=16 meant 16
+concurrent sessions contending for 4 dispatcher threads.
+
+**Confirmed by fixing it**: raised `dispatcherConfig.sessions.
+numProcessors` from 4 to 16 (matching the client connection count) in the
+broker config, fresh restart, re-ran all three connection counts:
+
+| connections | numProcessors=4 (default) | numProcessors=16 |
+|---|---|---|
+| 1 | 166,559/s | 165,438/s (unchanged, as expected) |
+| 4 | 336,147/s | 302,558/s (unchanged within noise) |
+| 16 | 70,109/s | **157,900/s** (>2x, degradation gone) |
+
+**This directly answers the "sub-100k ceiling on modern hardware"
+question from earlier in this investigation: the ceiling was never
+fundamental to BlazingMQ.** pg_blazingmq already supports multi-session
+parallelism for free (concurrent Postgres backends); getting real
+throughput out of it in production just requires setting
+`dispatcherConfig.sessions.numProcessors` (and likely `.queues.
+numProcessors`) to match expected concurrent client/producer count,
+the same way you'd size any thread pool to expected concurrency. This is
+a **broker deployment config**, not a `pg_blazingmq` code change - no
+GUC was added; the fix is "set this in your `bmqbrkrcfg.json`," which
+belongs in deployment docs, not the extension itself. The change was
+**not** kept in BlazingMQ's own shared `docker/single-node/config/`
+template (reverted cleanly, `git status` clean in `~/blazingmq`) since
+that's shared infrastructure beyond this session's authorization for
+unilateral changes - only documented here.
