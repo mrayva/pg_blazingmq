@@ -1247,52 +1247,114 @@ which was rigorously tested above and found *not* to scale: every
 consumer count from 1 to 32 hit the same ~42-48k/s wall, with 2 and 4
 consumers actively *collapsing* under live-publish contention (to ~3,999/s
 and ~32,000/s respectively) rather than scaling. This section tests
-whether NATS core's version of the same idea holds up any better.
+whether NATS core's version of the same idea holds up any better, now
+extended to N=16/32 and with the N=8 regression root-caused via `perf`.
 
 Script: `bench/nats_queue_group.py` (+ a throwaway orchestrator, not
-committed). One publisher process, N competing consumer processes (N = 1,
-2, 4, 8) all subscribed to one subject under the same queue-group name -
-every process is a separate OS process, avoiding the exact
-same-event-loop confound the selectivity test above already found and
-fixed (a subscriber's own inbound-message load leaking into publish-side
-timing). Fresh `nats-server` restart before each N. 100,000 messages per
-run, each carrying a sequence id so correctness can be checked directly:
-every run showed 0 duplicates and 0 missing (the full `{0..99999}` id set
-received exactly once, split across the group), and round-robin
-distribution was genuinely balanced, not skewed to one consumer - e.g. at
-N=8, each consumer received 12,386-12,672 of an expected ~12,500 share.
+committed - it starts/stops `nats-server` directly via
+`subprocess.Popen`/`.terminate()`, not `pkill`, which misbehaves in this
+environment). One publisher process, N competing consumer processes (N =
+1, 2, 4, 8, 16, 32) all subscribed to one subject under the same
+queue-group name - every process is a separate OS process, avoiding the
+exact same-event-loop confound the selectivity test above already found
+and fixed (a subscriber's own inbound-message load leaking into
+publish-side timing). Fresh `nats-server` restart before each N. 100,000
+messages per run, each carrying a sequence id so correctness can be
+checked directly: every run showed 0 duplicates and 0 missing (the full
+`{0..99999}` id set received exactly once, split across the group), and
+round-robin distribution was genuinely balanced at every N, not skewed to
+one consumer.
 
-| N | publish rate | aggregate consume rate | per-consumer share |
+**A real measurement confound was caught and fixed while extending this
+test**: the orchestrator's first draft started `nats-server` with `-js`.
+This is a pure core-NATS test (plain `publish`/`subscribe`, no
+`js.publish()` anywhere) with no reason to need JetStream at all - but
+`-js` reloads whatever JetStream streams happen to already exist on disk
+at `/tmp/nats/jetstream`, and this machine had several leftover from
+earlier, unrelated sessions (`BENCHSTREAM`, `TEST_EVENTS`,
+`PGNATS_PUB_BENCH`, assorted KV buckets). Their background
+housekeeping/consumer-heartbeat work showed up as real `jsAccount`/
+`fileStore`/`(*stream).processJetStreamMsgWithBatch` samples in a `perf`
+profile of what was supposed to be a JetStream-free workload, and
+depressed the N=16/32 numbers by roughly 30-40% versus the same
+configuration without `-js` (e.g. N=16 aggregate consume: ~525k/s with
+the leftover streams loaded vs ~722k/s without). Dropping `-js` entirely
+fixed it. The already-committed N=1/2/4/8 baseline below was re-measured
+from scratch with the corrected (no `-js`) orchestrator specifically to
+rule out the same confound having affected it - it reproduces the
+original numbers within a few percent, so that baseline was clean; only
+this extension's first draft was affected.
+
+| N | publish rate | aggregate consume rate | per-consumer share (min-max, N&gt;1) |
 |---|---|---|---|
-| 1 | 751,872/s | 404,611/s | [100000] |
-| 2 | 748,715/s | 764,878/s | [50001, 49999] |
-| 4 | 788,105/s | 915,954/s | [24775, 25226, 25191, 24808] |
-| 8 | 651,551/s | 772,467/s | [12413, 12672, 12544, 12474, 12644, 12386, 12396, 12471] |
+| 1 | 762,260/s | 397,308/s | [100000] |
+| 2 | 745,135/s | 770,689/s | 49,974-50,026 (expected 50,000) |
+| 4 | 743,272/s | 885,259/s | 24,778-25,162 (expected 25,000) |
+| 8 | 672,220/s | 800,681/s | 12,341-12,705 (expected 12,500) |
+| 16 | 627,382-637,927/s | 721,513-722,311/s | 6,088-6,361 (expected 6,250) |
+| 32 | 591,106/s | 668,818/s | 3,039-3,221 (expected 3,125) |
 
-**Finding: NATS core queue groups deliver real scaling gains that
-BlazingMQ's priority mode never showed - but the gains are bounded, not
-unlimited, and the blog post's unqualified claim is only half right.**
-Aggregate consume rate genuinely scales from N=1 to N=4 (404,611/s -&gt;
-915,954/s, ~2.3x), with the largest single jump between N=1 and N=2
-(~1.9x) - a real, structural difference from BlazingMQ's priority mode,
-which never produced a scaling gain at *any* consumer count. But it isn't
-unlimited: N=8 regresses on both axes relative to N=4 - aggregate consume
-rate drops to 772,467/s and publish rate drops too (651,551/s vs
-~750-790k/s at N=1/2/4) - so somewhere between N=4 and N=8, something
-starts limiting throughput here as well, just at a far higher absolute
-rate and with a much gentler degradation than BlazingMQ's outright
-collapse (not root-caused further - out of scope here, a natural
-follow-up would be `perf` on `nats-server` at N=8 the same way `bmqbrkr`
-was profiled elsewhere in this document).
+**Finding stands, now on a wider and confound-checked base: NATS core
+queue groups deliver real scaling gains BlazingMQ's priority mode never
+showed, peaking at N=4, then declining gently and monotonically - not
+collapsing - out to N=32.** Aggregate consume rate rises from N=1 to a
+peak at N=4 (397,308/s -&gt; 885,259/s, ~2.2x), then declines gradually:
+800,681/s at N=8, ~722,000/s at N=16, 668,818/s at N=32 - each step down
+by only 10-15%, nothing resembling BlazingMQ's outright collapse to
+~4,000-32,000/s at specific consumer counts. Correctness held at every N
+tested, including 32 - genuine, balanced round-robin the whole way out.
+
+**Root cause of the post-N=4 decline, via differential `perf record -g`
+on `nats-server` itself at N=4 (peak) vs N=8 (first regression)**, ~2M
+messages profiled at each point across 20 repeated cycles on one warm
+server (a different, throwaway methodology from the fresh-restart-per-N
+table above, used only to build up enough samples for a profile - not a
+new "official" rate measurement). Caveat: `nats-server` is a Go binary:
+function-level symbolization worked well, but expect less line-level
+precision than this document's C++ (`bmqbrkr.tsk`) profiling elsewhere.
+
+Self-time, grouped:
+- **`(*client).flushOutbound` (per-connection outbound socket write) is
+  both the single largest cost and the fastest-growing one**: 10.37% of
+  samples at N=4 (372 events) -&gt; 16.02% at N=8 (1,039 events) - nearly
+  3x the raw sample count for only 2x the consumer count. More competing
+  consumer connections means more separate per-client outbound writes to
+  service, and that cost doesn't scale linearly with connection count on
+  this workload - it scales worse.
+- **Lock contention around per-client delivery state**
+  (`sync.(*RWMutex).Lock`/`.Unlock`, reached via `deliverMsg` ->
+  `processMsgResults` -> `processInboundClientMsg`) stays a roughly
+  similar *share* of samples (14.96% at N=4, 12.11% at N=8) but grows in
+  absolute event count (535 -&gt; 753) - real, growing contention, just
+  outpaced by `flushOutbound`'s even faster growth.
+- **Go runtime scheduler/GC overhead is a real, distinct, growing
+  category** (`runtime.lock2`, `.stealWork`, `.findRunnable`,
+  `.runqgrab`, `.tryDeferToSpanScan`, `.unlock2`, `.mallocgcSmallNoscan`,
+  `.casgstatus`): ~9.3% of samples at N=4, ~12.7% at N=8 - more consumer
+  connections means more goroutines for the Go runtime itself to
+  schedule and garbage-collect around, a cost category that had no
+  analog in this document's C++ profiling of `bmqbrkr.tsk` (no Go
+  runtime there at all).
+
+So the N=4-&gt;N=32 decline isn't one new bottleneck appearing - it's an
+existing cost (per-connection outbound writes) that was already the
+largest single item at N=4, growing worse than linearly as competing
+consumers are added, compounded by growing lock contention and Go
+scheduler/GC overhead from managing more connections/goroutines. Not
+pinned down further: *why* `flushOutbound` specifically scales
+superlinearly with consumer count on this delivery path (a natural next
+step would be reading `nats-server`'s write-batching/coalescing logic
+directly, out of scope here).
 
 Practical takeaway: "queue groups enable horizontal scaling" is
-directionally true up to a point on this hardware, not the unconditional
-scaling promise the source article implied - a reader provisioning
-consumers expecting monotonic gains past N=4 would be wrong, on this
-config. Same caveat as the selectivity test above: single sample per N
-(not repeated/averaged), `nats-py` client (absolute rates aren't
-comparable to `nats_tool`'s C++ numbers elsewhere in this document - only
-the shape across N is the claim).
+directionally true up to a point on this hardware (peak at N=4), then a
+real but gentle decline, not a cliff - a reader provisioning consumers
+expecting monotonic gains past N=4 would be wrong, but nowhere near as
+wrong as the equivalent expectation would be on BlazingMQ's priority
+mode. Same caveat as the selectivity test above: `nats-py` client
+(absolute rates aren't comparable to `nats_tool`'s C++ numbers elsewhere
+in this document - only the shape across N is the claim).
 
 Teardown clean: `nats-server` and every consumer/publisher process
-terminated after each configuration.
+terminated after each configuration; perf data files not committed
+(large, machine-specific).
