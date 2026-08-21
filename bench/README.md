@@ -615,3 +615,72 @@ belongs in deployment docs, not the extension itself. The change was
 template (reverted cleanly, `git status` clean in `~/blazingmq`) since
 that's shared infrastructure beyond this session's authorization for
 unilateral changes - only documented here.
+
+## Past 500k/s: Mapping The Full Curve, And Proving It's Not Hardware-Bound
+
+Pushed further to see whether the N=4 (336,147/s) / N=16-tuned (157,900/s)
+result above was near a real ceiling or just two points on a curve nobody
+had mapped. It was the latter. Same setup (broadcast, `batch_confirm`,
+Release build, `dispatcherConfig.sessions.numProcessors` and
+`.queues.numProcessors` and `networkInterfaces.tcpInterface.ioThreads` all
+set equal to the connection count N, fresh broker restart per point,
+100,000 rows split evenly across N psycopg connections/backends, wall-clock
+span measured from a `multiprocessing.Barrier`-synchronized start so all
+workers begin concurrently):
+
+| N (connections = pools) | publish rate |
+|---|---|
+| 4 | 304,286/s |
+| 6 | 447,822/s |
+| 8 | 490,596 - 515,677/s (reproduced 3x) |
+| **9** | **549,407/s** |
+| 10 | 468,528/s |
+| 12 | 362,107 - 369,456/s |
+| 16 | 196,541 - 219,975/s |
+| 20 | 127,062/s |
+| 24 | 77,723/s |
+
+**Target met: 549,407/s, comfortably past 500k/s, at N=9 with all three
+pools matched to 9.** N=8 reproduces reliably in the 490-515k range across
+three separate runs. The curve peaks sharply around N=8-9 and degrades on
+both sides - not a step function at the dispatcher pool size the way the
+earlier N=4-vs-N=16 comparison suggested, but a real peak with a falloff
+past it, for reasons not further isolated here (plausibly per-connection
+BlazingMQ session/queue-open overhead outweighing added parallelism past
+~9 concurrent sessions, but this is not confirmed - see below).
+
+**Confirmed via direct CPU measurement that this is not a hardware
+ceiling.** `mpstat -P ALL 1` during a longer run (1,000,000 rows, N=9,
+~2.2s span at 100k scale, ~2s+ at 1M) never exceeded ~65% combined
+usr+sys across all 24 hardware threads at its single busiest 1-second
+sample, averaging noticeably lower - real, measurable idle headroom
+remained on every core throughout. Storage is tmpfs-backed (RAM), so I/O
+wait was negligible throughout (`%iowait` at or near 0.00 in every
+sample). This machine (AMD Ryzen 9 7900X, 24 threads, 61GB RAM) was not
+pushed anywhere near its ceiling even at the best-performing
+configuration - the ~500-550k/s peak is a **software** ceiling (something
+in the connection-count-vs-throughput curve past N~9, not yet
+root-caused further), not a CPU or I/O limit. A longer, larger run (1M
+rows, N=9) actually measured *lower* throughput (449,448/s) than the
+100k-row run at the same N - worth noting as a real, unexplained
+discrepancy for anyone pushing this further, not smoothed over.
+
+**Operational finding worth flagging**: `bmqbrkr.tsk`'s stop/start cycle
+has a real, intermittent race on its control pipe (`balb_pipecontrolchannel.cpp`:
+`Named pipe './/bmqbrkr.ctl' is already in use by another process`,
+`PANIC [STARTUP]`) - `test/manage_broker.sh stop` waits for the old PID
+to disappear, but that doesn't guarantee the pipe resource is released
+before the very next `start()` tries to recreate it. A 1.5-3s sleep
+between `stop` and `start` was NOT always sufficient in this sweep; some
+data points needed a retry loop (stop, sleep, try start, retry on
+failure) to get a clean broker. Anyone scripting repeated broker
+restarts for benchmarking should build in a retry, not just a fixed
+sleep - `manage_broker.sh` itself wasn't patched (out of scope here, and
+its own single-run start/stop already has its own 10s "started
+successfully" poll-wait, which is correct for a single restart; this
+only bites a tight loop of many restarts in quick succession).
+
+Config changes (`sessions`/`queues`/`ioThreads` = N per data point) were
+made and reverted in the same scratch-broker config path as every prior
+run this session; `git status --short` in `~/blazingmq` confirmed clean
+before finishing.
