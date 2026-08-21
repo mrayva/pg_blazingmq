@@ -1498,3 +1498,92 @@ build command in a header comment) and
 the lesson from an earlier fork's teardown bug in this environment).
 Teardown confirmed clean via `ps` after every run, including the ad hoc
 no-decode diagnostic.
+
+## Root cause of the discrepancy, and a real `nats_tool` fix (superseding the ad hoc driver above)
+
+The `mq_bench_driver.cpp` vs `nats-py` scaling-shape mismatch above is
+now resolved, and it wasn't `nats_sidecar` or NATS behaving differently
+under different tooling - it was a real inefficiency in the throwaway
+driver's own publish loop.
+
+**Root cause, confirmed by reading the code, not guessed**:
+`mq_bench_driver.cpp`'s `do_pub()` called `co_await conn->publish(...)`
+once per message, in a plain sequential loop - no batching, no
+pipelining. `nats_asio`'s `publish_impl()` does its own
+`guarded_socket_write()` (a real write syscall) per call, so every
+single message in that driver's 100,000-message loop paid a full
+write-syscall-plus-coroutine-resumption cost. This is exactly the
+`run_sequential()` shape `benchmarker.hpp`'s own `run_pipelined()` exists
+to avoid (batch many `PUB` commands into one buffer, one `write_raw()`
+call for the whole batch) - and it explains the driver's suspiciously
+low publish rate (95,684-136,628/s, versus 700k-900k+/s for pipelined
+`nats_tool` publishing elsewhere in this document on the same hardware).
+A slower, differently-paced producer changes the contention dynamics a
+cluster of competing consumers experiences, which is the most likely
+explanation for the shape (not just magnitude) mismatch against the
+`nats-py` harness.
+
+**Fix, added to `nats_tool` itself (`~/nats_asio`), not just the
+throwaway driver** - the user explicitly wants to standardize on
+`nats_tool` going forward, so this needed to be a real, reusable
+capability: `bench` mode's `benchmarker` (`samples/modes/benchmarker.hpp`)
+gained `set_msgpack_field(field, min, max)` plus two new CLI flags,
+`--msgpack_field`/`--msgpack_min`/`--msgpack_max`. When set, both
+`run_pipelined()` and `run_sequential()` build a real
+`zerialize::serialize<MsgPack>({field: N})` payload per message (N
+cycling `min..max` by message index) instead of the fixed dummy payload
+- wired into the *existing* fast batched-write path, not a new slower
+one. This is exactly the shape `nats_sidecar`'s `matching_engine` reads
+attributes from (the message body via `zerialize`, not NATS headers),
+so `nats_tool bench --msgpack_field region --msgpack_min 1 --msgpack_max 8`
+now produces real, filterable, `nats_sidecar`-compatible traffic without
+a one-off driver.
+
+Verified before trusting it: a small pipelined run (10,000 messages)
+decoded independently via a Python `msgpack` unpacker (not `nats_tool`'s
+own decode) confirmed an exact, even 1,250-per-value distribution across
+`region` 1-8, zero malformed payloads.
+
+**Re-ran the full N=1/2/4/8 sweep with the fixed `nats_tool`** (same
+parameters as both prior runs: `region:integer` schema, `atree` engine,
+`region = 1` filter registered per-instance, `--workers 2` per
+`nats_sidecar` instance, fresh `nats-server -js` restart with a
+throwaway JetStream store dir per N, 100,000 published messages,
+12,500 expected matches):
+
+| N | publish rate | filtered rate (matches/s) | scaling vs N=1 | correctness |
+|---|---|---|---|---|
+| 1 | ~750,000-8,300,000/s (local write completion, not server-processed) | 3,532/s | 1.00x | 12,500/12,500, 0 wrong-region |
+| 2 | same range | 6,251/s | 1.77x | 12,500/12,500, 0 wrong-region |
+| 4 | same range | 10,921/s | 3.09x | 12,500/12,500, 0 wrong-region |
+| 8 | same range | **20,853/s** | **5.91x** | 12,500/12,500, 0 wrong-region |
+
+**This confirms the root-cause diagnosis directly**: with a properly
+pipelined publisher, the scaling shape recovers to something close to
+the original `nats-py` result (5.91x-6.65x accelerating gain at N=8)
+and is nowhere near the broken driver's decelerating 2.67x. The
+remaining gap between this run's 20,853/s and `nats-py`'s 25,298/s at
+N=8 is plausibly the consumer side (a single `nats_tool grub` process
+counting all matches, same known limitation flagged in the section
+above) rather than anything publish-side - not fully closed, but the
+*shape* question that motivated this whole investigation is resolved.
+
+**Conclusion for future benchmarking in this ecosystem**: `nats_tool
+bench --msgpack_field ...` is now the standard, correct way to generate
+`nats_sidecar`-compatible filterable traffic - prefer it over a one-off
+driver for this class of test going forward, per the user's explicit
+request. Publish-rate numbers reported by `bench` mode reflect local
+write-completion time for a pipelined batch, not confirmed
+server-processed throughput - treat them as an upper bound on producer
+capacity, not a measured server-side rate (a distinction that matters
+less for `--no_ack` core-NATS publishing than it would for JetStream,
+but is worth remembering here since these numbers are much higher than
+this document's other `bench`-mode figures measured without
+`msgpack_field`, whose smaller fixed payload size and lack of
+per-message serialization cost aren't quite the same workload).
+
+Commits: `~/nats_asio` (`samples/modes/benchmarker.hpp`,
+`samples/nats_tool.cpp`) - real feature addition, extending the same
+narrow precedent as the earlier `bench --js` counting-bug fix
+(commit `5647b51`) in that repo, not a broad change; `~/pg_blazingmq`
+(`bench/README.md`) for this write-up.
