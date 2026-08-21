@@ -1,0 +1,7 @@
+-- Phase 1: proof-of-linkage. Constructs a real bmqa::Session without
+-- calling start(), so no live broker is actually required for this one -
+-- it's here for completeness/ordering, not because it needs the test
+-- broker manage_broker.sh starts.
+CREATE EXTENSION pg_blazingmq;
+
+SELECT pg_blazingmq_link_check('tcp://localhost:30114');

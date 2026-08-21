@@ -12,6 +12,13 @@ DATA = pg_blazingmq--0.1.sql pg_blazingmq--0.2.sql pg_blazingmq--0.3.sql \
        pg_blazingmq--0.4.sql pg_blazingmq--0.1--0.2.sql \
        pg_blazingmq--0.2--0.3.sql pg_blazingmq--0.3--0.4.sql
 
+# Sequential on purpose: pg_regress runs each file as its own fresh psql
+# connection (so g_session/g_queues start clean per file, matching what
+# Phase 3/4 already assume), and 04_subscribe's sink table depends on
+# nothing from earlier files - order here is really just "roughly the
+# order the phases were built in", not a real dependency chain.
+REGRESS = 01_link_check 02_publish_row 03_consume 04_subscribe
+
 # Root of a BlazingMQ checkout already built via bin/build-ubuntu.sh (BDE/NTF
 # installed under $(BMQ_ROOT)/include and $(BMQ_ROOT)/lib64; bmq group built
 # under $(BMQ_ROOT)/build/blazingmq - the bmq group has no separate install
@@ -64,3 +71,16 @@ override CFLAGS :=
 
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -c -o $@ $<
+
+# `make installcheck` (PGXS's own target, above) assumes a broker is
+# already running on tcp://localhost:30114 and pg_blazingmq is already
+# `make install`'d. `make test` is the one-command version: starts a
+# scratch broker, runs installcheck, always stops the broker after -
+# even if installcheck fails, so a failing test run doesn't leak a
+# background broker process.
+.PHONY: test
+test:
+	BMQ_ROOT=$(BMQ_ROOT) test/manage_broker.sh start
+	$(MAKE) installcheck; status=$$?; \
+	BMQ_ROOT=$(BMQ_ROOT) test/manage_broker.sh stop; \
+	exit $$status

@@ -30,6 +30,7 @@ extern "C" {
 #include "postmaster/interrupt.h"
 #include "storage/dsm.h"
 #include "storage/latch.h"
+#include "port/atomics.h"
 #include "executor/spi.h"
 #include "access/xact.h"
 #include "utils/snapmgr.h"
@@ -575,6 +576,16 @@ struct SubscriberConfig {
     Oid callback_fn;
     char queue_uri[512];
     char subscription_expr[512]; // empty = no filter
+    // WaitForBackgroundWorkerStartup() only confirms the OS process has
+    // started - not that it has finished connecting and opening its read
+    // queue (a real network round trip). Since BlazingMQ subscription
+    // filters apply only to already-active subscriptions at message
+    // *arrival* time (not retroactively), a message published right after
+    // bmq_subscribe() returns could be delivered to no one at all if the
+    // worker's queue isn't open yet. The worker flips this to 1 right
+    // after get_queue() succeeds; bmq_subscribe() polls it (bounded) before
+    // returning, closing that race in the common case.
+    pg_atomic_uint32 ready;
 };
 
 static const char* kSubscriberBgwType = "pg_blazingmq subscriber";
@@ -634,6 +645,7 @@ Datum bmq_subscribe(PG_FUNCTION_ARGS)
     cfg->callback_fn = callback_fn;
     strcpy(cfg->queue_uri, queue_uri.c_str());
     strcpy(cfg->subscription_expr, subscription_expr.c_str());
+    pg_atomic_init_u32(&cfg->ready, 0);
 
     // Outlive this backend - the worker attaches independently and this
     // call returns well before the subscription itself ends.
@@ -666,6 +678,25 @@ Datum bmq_subscribe(PG_FUNCTION_ARGS)
         ereport(ERROR,
                 (errmsg("BlazingMQ subscriber background worker failed to start "
                         "(status=%d) - check the server log", (int) status)));
+    }
+
+    // Bounded wait for the worker to actually open its queue (not just for
+    // the OS process to start) - see the comment on SubscriberConfig::ready.
+    // Best-effort: a slow-to-connect worker (e.g. broker unreachable) still
+    // gets its pid back with a WARNING rather than a hard failure, since the
+    // worker keeps retrying/running independently either way.
+    const int ready_timeout_ms = 5000;
+    const int poll_interval_us = 20000;
+    int waited_us = 0;
+    while (pg_atomic_read_u32(&cfg->ready) == 0 && waited_us < ready_timeout_ms * 1000) {
+        pg_usleep(poll_interval_us);
+        waited_us += poll_interval_us;
+    }
+    if (pg_atomic_read_u32(&cfg->ready) == 0) {
+        ereport(WARNING,
+                (errmsg("pg_blazingmq subscriber worker (pid %d) has not finished opening "
+                        "its queue after %dms - messages published immediately may not be "
+                        "delivered; it is still running and will keep trying", pid, ready_timeout_ms)));
     }
 
     dsm_detach(seg); // the worker has its own attachment now; pinned, so this is safe
@@ -707,23 +738,32 @@ void bmq_subscriber_main(Datum main_arg)
     if (!seg) {
         ereport(FATAL, (errmsg("pg_blazingmq subscriber: failed to attach DSM segment")));
     }
-    SubscriberConfig cfg = *(SubscriberConfig*) dsm_segment_address(seg);
-    dsm_detach(seg); // config is copied onto our own stack; done with the segment
+    SubscriberConfig* cfg = (SubscriberConfig*) dsm_segment_address(seg);
 
-    std::string queue_uri(cfg.queue_uri);
-    std::string subscription_expr(cfg.subscription_expr);
-    Oid callback_fn = cfg.callback_fn;
+    // Config fields we need for the whole worker lifetime get copied out now;
+    // the segment itself stays attached a little longer so we can flip
+    // cfg->ready once the queue is actually open (see SubscriberConfig).
+    std::string queue_uri(cfg->queue_uri);
+    std::string subscription_expr(cfg->subscription_expr);
+    Oid callback_fn = cfg->callback_fn;
+    Oid dbid = cfg->dbid;
+    Oid roleid = cfg->roleid;
 
     pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
     BackgroundWorkerUnblockSignals();
 
-    BackgroundWorkerInitializeConnectionByOid(cfg.dbid, cfg.roleid, 0);
+    BackgroundWorkerInitializeConnectionByOid(dbid, roleid, 0);
 
     elog(LOG, "pg_blazingmq subscriber started for queue '%s'", queue_uri.c_str());
 
+    bool seg_detached = false;
     try {
         bmqa::Session& session = get_session();
         get_queue(session, queue_uri, subscription_expr);
+
+        pg_atomic_write_u32(&cfg->ready, 1);
+        dsm_detach(seg); // caller may now be polling ready=1 and return at any time
+        seg_detached = true;
 
         while (!ShutdownRequestPending) {
             CHECK_FOR_INTERRUPTS();
@@ -789,6 +829,13 @@ void bmq_subscriber_main(Datum main_arg)
             }
         }
     } catch (const std::exception& ex) {
+        // If get_session()/get_queue() failed before ready was ever set, seg
+        // is still attached here - the caller's poll loop will time out on
+        // its own and log a WARNING (the pid is still valid, though this
+        // worker is about to exit). Detach explicitly in that case only;
+        // once seg_detached is true, seg is a dangling pointer (dsm_detach
+        // frees it) and must not be touched again.
+        if (!seg_detached) dsm_detach(seg);
         ereport(LOG,
                 (errmsg("pg_blazingmq subscriber for queue '%s' exiting on error: %s",
                         queue_uri.c_str(), ex.what())));

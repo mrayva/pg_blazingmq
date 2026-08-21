@@ -14,7 +14,7 @@ Postgres rows speak that: promote chosen columns to typed message properties
 float/double type, and no list-membership operator in its expression
 grammar), and pack the full row as the message payload via `pg_zerialize`.
 
-## Status: Phase 4 (push-consume)
+## Status: Phase 5 (tests)
 
 `pg_blazingmq_link_check()` (Phase 1) constructs a real `bmqa::Session`
 (without calling `start()`, so no live broker is needed) to prove the
@@ -84,6 +84,18 @@ separate subscription registry either: every background worker already
 shows up in `pg_stat_activity` with `backend_type` set to `'pg_blazingmq
 subscriber'`, which is exactly what `bmq_unsubscribe()` checks before
 signaling a PID, so it can't be used to terminate arbitrary processes.
+
+`bmq_subscribe()` doesn't return until the worker has actually opened its
+read queue, not merely until its OS process has started - `Wait
+ForBackgroundWorkerStartup()` alone only guarantees the latter, and given
+the non-retroactive filtering semantic above, a message published in the
+gap between "process started" and "queue actually open" would be delivered
+to no one. The worker signals readiness through an atomic flag in the same
+DSM segment used for the initial config handoff; `bmq_subscribe()` polls it
+(bounded, 5s) before returning. This is best-effort, not a hard guarantee -
+a worker that's still slow to connect after 5s (e.g. broker unreachable)
+still gets its PID back, with a `WARNING` instead of a hard failure, since
+it keeps running and retrying independently either way.
 
 ```sql
 CREATE EXTENSION pg_blazingmq;
@@ -175,6 +187,36 @@ anything that was already built under the old, non-PIC configuration):
 cd build/blazingmq && ninja bmqbrkr.tsk bmqtool.tsk
 ```
 
+## Testing
+
+`make test` is the one-command entry point: starts a scratch single-node
+broker (`test/manage_broker.sh`, reusing BlazingMQ's own
+`docker/single-node/config`, patched to a local `test/.broker_scratch/`
+data dir instead of `/var/local/bmq`), runs `make installcheck`, then always
+stops the broker afterward - even on failure, so a failing run doesn't leak
+a background broker process. Requires `pg_blazingmq` already `make
+install`'d and the broker/tool executables built (see Building above).
+
+`REGRESS = 01_link_check 02_publish_row 03_consume 04_subscribe` covers all
+four phases plus `bmq_subscribe`/`bmq_unsubscribe` lifecycle management. A
+few things worth knowing if you're reading or extending these:
+
+- Each `sql/*.sql` file is its own fresh `psql` connection under
+  `pg_regress`, so the per-backend session/queue-handle cache starts clean
+  per file - matching what Phases 3/4 already assume.
+- `04_subscribe.sql`'s subscribe/publish/verify/unsubscribe sequence runs
+  inside one `DO $$ ... $$` block: `bmq_subscribe()` returns a real PID,
+  which isn't reproducible across runs, so it must never leak into a query
+  result `pg_regress` diffs - only into `RAISE` messages under the test's
+  own control, or not at all on success.
+- If a test fails *inside* that `DO` block before reaching
+  `bmq_unsubscribe()`, the subscriber worker it started is left running,
+  holding a connection open to `contrib_regression` - the next
+  `make installcheck` run's `DROP DATABASE` will then fail with "database
+  is being accessed by other users". Recover with
+  `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE
+  backend_type = 'pg_blazingmq subscriber';` before retrying.
+
 ## Plan
 
 See the project's own notes for the full phased plan:
@@ -189,5 +231,6 @@ See the project's own notes for the full phased plan:
    subscription_expr)` / `bmq_unsubscribe(worker_pid)`: dynamic background
    worker + DSM config handoff + per-message SPI callback dispatch,
    mirroring `pgnats`'s `nats_subscribe(subject, fn_oid)`.
-5. **Tests** - `pg_regress` suite against a real single-node broker.
+5. **Tests** (done) - `pg_regress` suite against a real single-node broker,
+   `make test` as the one-command entry point (see Testing above).
 6. **Docs**.
