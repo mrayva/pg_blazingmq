@@ -439,3 +439,88 @@ column produces a spurious mismatch - this cost ~1% of rows a false
 confirmed independently via an in-process `row_to_msgpack`/
 `msgpack_to_jsonb` vs `to_jsonb` comparison (zero mismatches) before the
 NATS round-trip was even involved.
+
+## Raw Client, Out-of-Postgres, Parallel Publish
+
+Every number above went through Postgres SQL on both sides (`bmq_publish_row`/
+`nats_publish_binary`-style functions). This section removes Postgres
+entirely and tests each system's own native client tool directly -
+`bmqtool` (BlazingMQ's official CLI, `--mode auto`) and `nats_tool`'s
+purpose-built `bench` mode - both to isolate any Postgres-layer overhead
+and to test genuine multi-connection parallelism, which nothing above did.
+Synthetic 355-byte payloads (matching the real fixture's average msgpack
+row size), fresh broker/server restart before this session, 1,000,000
+messages per run unless noted. Timed by wall-clock bracketing the whole
+run (`date +%s.%N` around the process, or the tool's own single
+start/end `steady_clock` measurement for `nats_tool bench` - not a
+periodic stats-log tick, avoiding the exact artifact class found and
+fixed twice earlier in this document).
+
+**BlazingMQ** (`bmqtool --mode auto`, broadcast queue, `WRITE`-only, no
+ack requested - the least-overhead config, matching NATS core's own
+unacked default):
+
+| connections (separate processes) | publish rate |
+|---|---|
+| 1 | 84,584/s |
+| 4 | 94,094/s |
+| 16 | 93,627/s |
+
+Scales modestly from 1→4 connections (+11%), then flatlines - the
+bottleneck past 4 concurrent producers is server-side (likely
+single-threaded domain/queue processing), not client-side. **Genuinely
+surprising result, not assumed**: this raw-client number is *lower* than
+the Postgres-driven `bmq_publish_row` publish rate (~147k/s, broadcast +
+`batch_confirm`, Release build, earlier in this document) - Postgres was
+never the bottleneck on the publish side; if anything `bmqtool`'s own
+posting loop is less efficient here than pg_blazingmq's
+`MessageEventBuilder`-based batching. Not fully root-caused - `bmqtool`'s
+`--postrate`/`--postinterval`/`--eventsize` scheduling model may simply
+not be tuned for unthrottled max-speed posting the way a tight pipelined
+loop is.
+
+**NATS core** (`nats_tool bench`, no JetStream, no ack - core's normal
+fire-and-forget mode):
+
+| connections | publish rate |
+|---|---|
+| 1 | 5,263,158/s |
+| 4 | 8,333,333/s |
+| 16 | 7,633,588/s |
+
+Already far beyond anything either system does with durability enabled at
+N=1 - consistent with everything else this document has found about NATS
+core doing structurally less per-message work than either BlazingMQ or
+JetStream. This is not a fair comparison point for pg_blazingmq (see "The
+NATS core comparison was never real" section above) - included here only
+for completeness/scale, not as a rate to close a gap against.
+
+**NATS JetStream** (`nats_tool bench --js --create_stream`, acked, the
+fair comparison point):
+
+| connections | count | publish rate |
+|---|---|---|
+| 1 | 100,000 | 150,830/s |
+
+Matches the Postgres-driven JetStream publish rate (~151k/s) almost
+exactly - Postgres wasn't a bottleneck on this side either. **A `nats_tool
+bench --js` counting bug was found at scale**, worth flagging for
+`nats_asio` separately from this benchmark: at `--count 1000000` (both
+with and without `--no_ack`), the periodic `Stats:` lines report a
+plausible, sustained ~100-150k events/sec for the full run duration, but
+the final "Messages: N" summary reports a much smaller N (93,878 and
+16,079 respectively) than the requested count or than the sustained
+per-tick rate implies - the run exits early without publishing (or without
+correctly counting) the full requested count. Not investigated further
+here (out of scope for a benchmark task); the 100,000-count run above
+completed cleanly and is the trustworthy number. N=4/N=16 JetStream
+parallelism numbers were not obtained because of this - would need the
+counting bug fixed first, or count kept at 100,000 with connections
+splitting that total instead of multiplying it.
+
+**Bottom line**: going around Postgres didn't change the ceiling on
+either system's durable/comparable path (JetStream) - Postgres was never
+the bottleneck there. On BlazingMQ's side, the raw client was actually
+*slower* than the Postgres-driven number, a genuinely counterintuitive
+result pointing at `bmqtool`'s own load-generation code rather than
+anything about BlazingMQ, Postgres, or pg_blazingmq.
