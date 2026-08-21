@@ -228,7 +228,62 @@ not root-caused (see prior section).
 
 **Bottom line**: pg_blazingmq's best confirmed, reproducible throughput is
 **broadcast mode, ~72-75k/s receive** (batch_confirm adds nothing further
-in broadcast mode; it matters only in priority mode). The real, controlled
-gap to NATS core at its best measured, freshly-restarted rate
-(~110-111k/s) is about **1.5x**, not the far larger gap implied by
-uncontrolled measurements earlier in this document.
+in broadcast mode; it matters only in priority mode).
+
+## The NATS "receive rate" was never real - it's a measurement artifact, not a warmup effect
+
+The 1.5x-gap conclusion above is itself superseded. The suspicion at the end
+of the previous section (that `nats_publish_from_sql.py --verify`'s
+receive-timing might be a polling artifact, not a warmup effect) was
+isolated directly and confirmed: **it's entirely an artifact, and the "true"
+NATS receive rate isn't a comparable number at all.**
+
+Root cause: `nats_tool`'s `--stats_interval` is a whole-integer-seconds-only
+timer (`worker.hpp`'s `m_stats_interval` is an `int`, driving
+`timer.expires_after(std::chrono::seconds(...))`), hardcoded to `1` by
+`nats_publish_from_sql.py`. It cannot emit its first "Stats: N events/sec"
+line before a full second has elapsed, regardless of how fast messages
+actually arrived - so `wait_for_received_count()`'s reported "receive_secs"
+is really just "time until the next 1-second stats tick fires and gets
+observed," not real delivery time.
+
+To measure the real thing, a one-off diagnostic script drove
+`nats_publish_from_sql.py --verify --keep-dump` as a subprocess and, from
+the exact same t0 reference point the script itself uses ("Waiting for
+delivery," i.e. right after publish finishes), polled the `--dump` file's
+line count directly at ~10ms resolution instead of parsing the 1s-granular
+stats log (the dump file flushes every 100 messages, not on a timer - see
+`message_output.hpp`'s `dump_file_writer`). Result, reproduced across 3
+fresh-`nats-server` runs: **the dump file already contained all 100,000
+lines within ~17ms of that reference point, every time** (17.0ms, 17.6ms,
+17.5ms). The consumer was subscribed before publishing began, so messages
+were arriving essentially as fast as they were published (100,000 rows
+published in ~1.05-1.07s, ~93-96k/s) - by the time the script started
+"waiting," receipt was already ~100% complete. The 0.75-0.9s / 110-133k/s
+figures the script reports are not measuring anything about NATS's true
+delivery speed; they're measuring how long until the next second-boundary
+stats tick happens to land.
+
+**This also means the whole "receive rate" comparison against pg_blazingmq
+was comparing two different things, not just using two different clocks.**
+`bmq_consume()` synchronously *pulls* a backlog of already-published,
+persisted messages after the fact - a real, meaningful "how fast can this
+drain a queue" number. NATS core here is *push*-delivered to an
+already-subscribed, concurrently-running consumer - there is no backlog to
+drain, so "receive rate" isn't really a rate NATS core has in this
+scenario; delivery lag relative to publish is near-zero. The fairer
+NATS-side number for this workload shape is its **publish rate**
+(~93-96k/s, comparable to pg_blazingmq's own ~58-91k/s publish numbers
+depending on variant), not a "receive rate" that was never really
+measuring delivery throughput at all.
+
+**Bottom line, superseding every earlier "gap to NATS" framing in this
+document**: pg_blazingmq's best confirmed, reproducible pull-consume rate
+is **broadcast mode, ~72-75k/s**. There is no reliable, comparable NATS
+core "receive rate" figure to set it against - the push/pull architectural
+difference between the two systems means that specific comparison doesn't
+have a single well-defined answer. If a future benchmark wants a genuinely
+fair NATS-side number, measure end-to-end per-message publish-to-delivery
+*latency* (not a rate derived from a coarse periodic counter) rather than
+trying to force NATS's push model into a "receive rate" shape built for
+pg_blazingmq's pull model.
