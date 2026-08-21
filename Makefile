@@ -9,7 +9,8 @@ OBJS = pg_blazingmq.o
 
 EXTENSION = pg_blazingmq
 DATA = pg_blazingmq--0.1.sql pg_blazingmq--0.2.sql pg_blazingmq--0.3.sql \
-       pg_blazingmq--0.1--0.2.sql pg_blazingmq--0.2--0.3.sql
+       pg_blazingmq--0.4.sql pg_blazingmq--0.1--0.2.sql \
+       pg_blazingmq--0.2--0.3.sql pg_blazingmq--0.3--0.4.sql
 
 # Root of a BlazingMQ checkout already built via bin/build-ubuntu.sh (BDE/NTF
 # installed under $(BMQ_ROOT)/include and $(BMQ_ROOT)/lib64; bmq group built

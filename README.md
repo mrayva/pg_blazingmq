@@ -14,7 +14,7 @@ Postgres rows speak that: promote chosen columns to typed message properties
 float/double type, and no list-membership operator in its expression
 grammar), and pack the full row as the message payload via `pg_zerialize`.
 
-## Status: Phase 3 (pull-consume)
+## Status: Phase 4 (push-consume)
 
 `pg_blazingmq_link_check()` (Phase 1) constructs a real `bmqa::Session`
 (without calling `start()`, so no live broker is needed) to prove the
@@ -60,6 +60,31 @@ the *old* filter and will still arrive unfiltered. Establish the
 subscription you want before publishing the messages you want filtered by
 it, not after.
 
+`bmq_subscribe(queue_uri, callback_fn, subscription_expr)` (Phase 4)
+registers a dedicated background worker that stays subscribed indefinitely,
+calling `callback_fn(payload bytea)` for every message received. Returns
+the worker's PID, which doubles as the subscription handle for
+`bmq_unsubscribe(worker_pid)`. Unlike `bmq_consume()`, delivery is
+at-least-once by design: each message runs in its own transaction, and is
+only confirmed *after* `callback_fn` returns successfully - if it raises
+an error, that transaction rolls back, a `WARNING` is logged, and the
+message is left unconfirmed for BlazingMQ to redeliver.
+
+The worker is registered dynamically (`RegisterDynamicBackgroundWorker`)
+with its one-time config (queue URI, callback OID, subscription
+expression, target database/role) handed off via a pinned Dynamic Shared
+Memory segment - deliberately not a `shmem_request_hook`-managed
+structure, which would require `shared_preload_libraries` plus a server
+restart. This needs neither: `bmq_subscribe()` works immediately after
+`CREATE EXTENSION`, no restart. The worker uses the *database's* default
+`blazingmq.broker_uri` (`ALTER DATABASE ... SET`), not the calling
+session's - a session-local `SET` doesn't propagate to it, since the
+worker is a separate OS process with its own GUC state. There's no
+separate subscription registry either: every background worker already
+shows up in `pg_stat_activity` with `backend_type` set to `'pg_blazingmq
+subscriber'`, which is exactly what `bmq_unsubscribe()` checks before
+signaling a PID, so it can't be used to terminate arbitrary processes.
+
 ```sql
 CREATE EXTENSION pg_blazingmq;
 SELECT pg_blazingmq_link_check('tcp://localhost:30114');
@@ -68,22 +93,37 @@ SELECT pg_blazingmq_link_check('tcp://localhost:30114');
 --  pg_blazingmq link OK: brokerUri=tcp://localhost:30114 numProcessingThreads=1
 
 CREATE TABLE trades (region int, symbol text, price float8, active bool);
+CREATE TABLE received_messages (region int, symbol text, price float8, active bool);
+
+CREATE FUNCTION handle_trade(payload bytea) RETURNS void AS $$
+DECLARE j jsonb;
+BEGIN
+  j := msgpack_to_jsonb(payload);  -- pg_zerialize decodes the payload
+  INSERT INTO received_messages (region, symbol, price, active)
+  VALUES ((j->>'region')::int, j->>'symbol', (j->>'price')::float8, (j->>'active')::bool);
+END;
+$$ LANGUAGE plpgsql;
+
+-- Workers use the database's broker_uri, not a session-local SET.
+ALTER DATABASE mydb SET blazingmq.broker_uri = 'tcp://localhost:30114';
+
+SELECT bmq_subscribe('bmq://bmq.test.priority/trades', 'handle_trade'::regproc) AS worker_pid;
+--  worker_pid
+-- ------------
+--      793808
+
+SET blazingmq.broker_uri = 'tcp://localhost:30114';  -- for this session's own publish call
 INSERT INTO trades VALUES (1, 'AAPL', 150.25, true), (2, 'MSFT', 305.5, false);
+SELECT bmq_publish_row('bmq://bmq.test.priority/trades', trades, ARRAY['region']) FROM trades;
 
-SET blazingmq.broker_uri = 'tcp://localhost:30114';
+-- moments later, asynchronously, with no further action from this session:
+SELECT * FROM received_messages;
+--  region | symbol | price  | active
+-- --------+--------+--------+--------
+--       1 | AAPL   | 150.25 | t
+--       2 | MSFT   |  305.5 | f
 
--- Establish the filter before publishing (see semantic note above).
-SELECT count(*) FROM bmq_consume('bmq://bmq.test.priority/trades', 'region == 1', 5, 500);
-
-SELECT bmq_publish_row('bmq://bmq.test.priority/trades', trades, ARRAY['region'])
-FROM trades;
-
-SELECT msgpack_to_jsonb(bmq_consume)  -- pg_zerialize decodes the payload
-FROM bmq_consume('bmq://bmq.test.priority/trades', 'region == 1', 5, 3000);
---                         msgpack_to_jsonb
--- ------------------------------------------------------------------
---  {"price": 150.25, "active": true, "region": 1, "symbol": "AAPL"}
--- (only region=1 delivered - MSFT/region=2 was correctly filtered out)
+SELECT bmq_unsubscribe(793808);  -- stops the worker cleanly
 ```
 
 ## Building
@@ -145,7 +185,9 @@ See the project's own notes for the full phased plan:
    attr_columns)`: column→property mapping, zerialize-packed payload.
 3. **Pull-consume** (done) - `bmq_consume(queue_uri, subscription_expr,
    max_messages, timeout_ms)`.
-4. **Push-consume** - background worker + SPI callback dispatch, mirroring
-   `pgnats`'s `nats_subscribe(subject, fn_oid)`.
+4. **Push-consume** (done) - `bmq_subscribe(queue_uri, callback_fn,
+   subscription_expr)` / `bmq_unsubscribe(worker_pid)`: dynamic background
+   worker + DSM config handoff + per-message SPI callback dispatch,
+   mirroring `pgnats`'s `nats_subscribe(subject, fn_oid)`.
 5. **Tests** - `pg_regress` suite against a real single-node broker.
 6. **Docs**.

@@ -26,12 +26,25 @@ extern "C" {
 #include "nodes/execnodes.h"
 #include "miscadmin.h"
 #include "varatt.h"
+#include "postmaster/bgworker.h"
+#include "postmaster/interrupt.h"
+#include "storage/dsm.h"
+#include "storage/latch.h"
+#include "executor/spi.h"
+#include "access/xact.h"
+#include "utils/snapmgr.h"
+#include "utils/syscache.h"
+#include "catalog/pg_proc.h"
+#include "libpq/pqsignal.h"
+#include <signal.h>
+#include <unistd.h>
 
 #ifdef PG_MODULE_MAGIC
 PG_MODULE_MAGIC;
 #endif
 
 void _PG_init(void);
+PGDLLEXPORT void bmq_subscriber_main(Datum main_arg);
 }
 
 #include <bmqa_session.h>
@@ -539,4 +552,252 @@ Datum bmq_consume(PG_FUNCTION_ARGS)
     return (Datum) 0;
 }
 
-} // extern "C"
+// --- Phase 4: push-consume via a dynamic background worker -----------------
+//
+// bmq_subscribe() hands off a small fixed-size config struct to a freshly
+// registered dynamic background worker via a Dynamic Shared Memory (DSM)
+// segment - deliberately *not* a custom shmem_request_hook-managed
+// structure, since that requires shared_preload_libraries plus a server
+// restart to take effect. DSM segments need neither: they're created at
+// runtime by any backend and (once dsm_pin_segment()'d) outlive the
+// creating backend, which is exactly the "one-shot handoff to a worker
+// that then runs independently" shape this needs.
+//
+// The worker's PID doubles as the subscription handle - no separate
+// registry is needed since Postgres already exposes every background
+// worker in pg_stat_activity (as backend_type = bgw_type, set below),
+// which is also what bmq_unsubscribe() uses to confirm a PID is actually
+// one of this extension's workers before signaling it.
+
+struct SubscriberConfig {
+    Oid dbid;
+    Oid roleid;
+    Oid callback_fn;
+    char queue_uri[512];
+    char subscription_expr[512]; // empty = no filter
+};
+
+static const char* kSubscriberBgwType = "pg_blazingmq subscriber";
+
+// Checks callback_fn exists and takes exactly one bytea argument. Doesn't
+// check the return type - it's discarded either way (OidFunctionCall1's
+// result is ignored in the worker), so any return type is harmless.
+static void validate_callback_fn(Oid callback_fn)
+{
+    HeapTuple tup = SearchSysCache1(PROCOID, ObjectIdGetDatum(callback_fn));
+    if (!HeapTupleIsValid(tup)) {
+        ereport(ERROR, (errmsg("callback function with OID %u does not exist", callback_fn)));
+    }
+    Form_pg_proc proc = (Form_pg_proc) GETSTRUCT(tup);
+    bool ok = (proc->pronargs == 1) && (proc->proargtypes.values[0] == BYTEAOID);
+    ReleaseSysCache(tup);
+    if (!ok) {
+        ereport(ERROR,
+                (errmsg("callback function must take exactly one \"bytea\" argument")));
+    }
+}
+
+extern "C" {
+
+PG_FUNCTION_INFO_V1(bmq_subscribe);
+
+Datum bmq_subscribe(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0)) ereport(ERROR, (errmsg("queue_uri must not be null")));
+    if (PG_ARGISNULL(1)) ereport(ERROR, (errmsg("callback_fn must not be null")));
+
+    text* queue_uri_text = PG_GETARG_TEXT_PP(0);
+    std::string queue_uri(VARDATA_ANY(queue_uri_text), VARSIZE_ANY_EXHDR(queue_uri_text));
+    Oid callback_fn = PG_GETARG_OID(1);
+
+    std::string subscription_expr;
+    if (!PG_ARGISNULL(2)) {
+        text* t = PG_GETARG_TEXT_PP(2);
+        subscription_expr.assign(VARDATA_ANY(t), VARSIZE_ANY_EXHDR(t));
+    }
+
+    validate_callback_fn(callback_fn);
+
+    if (queue_uri.size() >= sizeof(SubscriberConfig::queue_uri)) {
+        ereport(ERROR, (errmsg("queue_uri is too long (max %zu bytes)",
+                                sizeof(SubscriberConfig::queue_uri) - 1)));
+    }
+    if (subscription_expr.size() >= sizeof(SubscriberConfig::subscription_expr)) {
+        ereport(ERROR, (errmsg("subscription_expr is too long (max %zu bytes)",
+                                sizeof(SubscriberConfig::subscription_expr) - 1)));
+    }
+
+    dsm_segment* seg = dsm_create(sizeof(SubscriberConfig), 0);
+    SubscriberConfig* cfg = (SubscriberConfig*) dsm_segment_address(seg);
+    cfg->dbid = MyDatabaseId;
+    cfg->roleid = GetUserId();
+    cfg->callback_fn = callback_fn;
+    strcpy(cfg->queue_uri, queue_uri.c_str());
+    strcpy(cfg->subscription_expr, subscription_expr.c_str());
+
+    // Outlive this backend - the worker attaches independently and this
+    // call returns well before the subscription itself ends.
+    dsm_pin_segment(seg);
+
+    BackgroundWorker worker;
+    memset(&worker, 0, sizeof(worker));
+    snprintf(worker.bgw_name, BGW_MAXLEN, "%s", kSubscriberBgwType);
+    snprintf(worker.bgw_type, BGW_MAXLEN, "%s", kSubscriberBgwType);
+    worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
+    worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+    worker.bgw_restart_time = BGW_NEVER_RESTART;
+    snprintf(worker.bgw_library_name, MAXPGPATH, "pg_blazingmq");
+    snprintf(worker.bgw_function_name, BGW_MAXLEN, "bmq_subscriber_main");
+    worker.bgw_main_arg = UInt32GetDatum(dsm_segment_handle(seg));
+    worker.bgw_notify_pid = MyProcPid;
+
+    BackgroundWorkerHandle* handle;
+    if (!RegisterDynamicBackgroundWorker(&worker, &handle)) {
+        dsm_detach(seg);
+        ereport(ERROR,
+                (errmsg("failed to register BlazingMQ subscriber background worker "
+                        "(max_worker_processes may be exhausted)")));
+    }
+
+    pid_t pid;
+    BgwHandleStatus status = WaitForBackgroundWorkerStartup(handle, &pid);
+    if (status != BGWH_STARTED) {
+        dsm_detach(seg);
+        ereport(ERROR,
+                (errmsg("BlazingMQ subscriber background worker failed to start "
+                        "(status=%d) - check the server log", (int) status)));
+    }
+
+    dsm_detach(seg); // the worker has its own attachment now; pinned, so this is safe
+    PG_RETURN_INT32((int32) pid);
+}
+
+PG_FUNCTION_INFO_V1(bmq_unsubscribe);
+
+Datum bmq_unsubscribe(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0)) ereport(ERROR, (errmsg("worker_pid must not be null")));
+    int32 pid = PG_GETARG_INT32(0);
+
+    bool is_ours = false;
+    SPI_connect();
+    Oid argtypes[2] = {INT4OID, TEXTOID};
+    Datum argvalues[2] = {Int32GetDatum(pid), CStringGetTextDatum(kSubscriberBgwType)};
+    int rc = SPI_execute_with_args(
+        "SELECT 1 FROM pg_stat_activity WHERE pid = $1 AND backend_type = $2",
+        2, argtypes, argvalues, nullptr, true, 1);
+    if (rc == SPI_OK_SELECT && SPI_processed > 0) is_ours = true;
+    SPI_finish();
+
+    if (!is_ours) {
+        ereport(ERROR,
+                (errmsg("pid %d is not an active pg_blazingmq subscriber worker", pid)));
+    }
+
+    if (kill(pid, SIGTERM) != 0) {
+        ereport(WARNING, (errmsg("failed to signal worker pid %d: %m", pid)));
+        PG_RETURN_BOOL(false);
+    }
+    PG_RETURN_BOOL(true);
+}
+
+void bmq_subscriber_main(Datum main_arg)
+{
+    dsm_segment* seg = dsm_attach(DatumGetUInt32(main_arg));
+    if (!seg) {
+        ereport(FATAL, (errmsg("pg_blazingmq subscriber: failed to attach DSM segment")));
+    }
+    SubscriberConfig cfg = *(SubscriberConfig*) dsm_segment_address(seg);
+    dsm_detach(seg); // config is copied onto our own stack; done with the segment
+
+    std::string queue_uri(cfg.queue_uri);
+    std::string subscription_expr(cfg.subscription_expr);
+    Oid callback_fn = cfg.callback_fn;
+
+    pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
+    BackgroundWorkerUnblockSignals();
+
+    BackgroundWorkerInitializeConnectionByOid(cfg.dbid, cfg.roleid, 0);
+
+    elog(LOG, "pg_blazingmq subscriber started for queue '%s'", queue_uri.c_str());
+
+    try {
+        bmqa::Session& session = get_session();
+        get_queue(session, queue_uri, subscription_expr);
+
+        while (!ShutdownRequestPending) {
+            CHECK_FOR_INTERRUPTS();
+
+            // Short poll so SIGTERM is noticed promptly - session.nextEvent()
+            // itself doesn't know about Postgres's shutdown signal.
+            bmqa::Event event = session.nextEvent(bsls::TimeInterval(1, 0));
+            if (!event.isMessageEvent()) continue;
+
+            bmqa::MessageEvent msgEvent = event.messageEvent();
+            if (msgEvent.type() != bmqt::MessageEventType::e_PUSH) continue;
+
+            bmqa::MessageIterator msgIter = msgEvent.messageIterator();
+            while (msgIter.nextMessage()) {
+                const bmqa::Message& msg = msgIter.message();
+
+                int dataSize = msg.dataSize();
+                bytea* payload = (bytea*) palloc(VARHDRSZ + dataSize);
+                SET_VARSIZE(payload, VARHDRSZ + dataSize);
+                if (dataSize > 0) {
+                    bdlbb::Blob blob;
+                    msg.getData(&blob);
+                    bdlbb::BlobUtil::copy(VARDATA(payload), blob, 0, dataSize);
+                }
+
+                bool callback_ok = true;
+                SetCurrentStatementStartTimestamp();
+                StartTransactionCommand();
+                SPI_connect();
+                PushActiveSnapshot(GetTransactionSnapshot());
+
+                PG_TRY();
+                {
+                    OidFunctionCall1(callback_fn, PointerGetDatum(payload));
+                }
+                PG_CATCH();
+                {
+                    ErrorData* edata = CopyErrorData();
+                    FlushErrorState();
+                    callback_ok = false;
+                    PopActiveSnapshot();
+                    SPI_finish();
+                    AbortCurrentTransaction();
+                    ereport(WARNING,
+                            (errmsg("pg_blazingmq subscriber: callback failed for queue "
+                                    "'%s', message left unconfirmed: %s",
+                                    queue_uri.c_str(), edata->message)));
+                    FreeErrorData(edata);
+                }
+                PG_END_TRY();
+
+                if (callback_ok) {
+                    PopActiveSnapshot();
+                    SPI_finish();
+                    CommitTransactionCommand();
+                    // Only confirm on success - at-least-once delivery: a
+                    // failed callback leaves the message unconfirmed, so
+                    // BlazingMQ will redeliver it.
+                    session.confirmMessage(msg);
+                }
+
+                if (ShutdownRequestPending) break;
+            }
+        }
+    } catch (const std::exception& ex) {
+        ereport(LOG,
+                (errmsg("pg_blazingmq subscriber for queue '%s' exiting on error: %s",
+                        queue_uri.c_str(), ex.what())));
+    }
+
+    elog(LOG, "pg_blazingmq subscriber stopping for queue '%s'", queue_uri.c_str());
+    proc_exit(0);
+}
+
+} // extern "C" (Phase 4 block, opened above validate_callback_fn)
+
+} // extern "C" (main block, opened before pg_blazingmq_link_check)
