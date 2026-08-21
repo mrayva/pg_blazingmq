@@ -1711,3 +1711,66 @@ does real filtering work in between, changing the pacing) - not
 evidence that this hardware needs to be bigger to go further.
 
 Teardown confirmed clean via `ps` after every run, both passes.
+
+### Root cause of the N=16→32 plateau, confirmed via `perf`
+
+**Checked the simplest explanation first, and ruled it out with direct
+measurement, not assumption.** Every version of this test uses a single
+downstream process (`mq_bench_driver subfield`, one connection, one
+`io_context`, single-threaded) to count all N instances' combined
+filtered output - a real, plausible single-process ceiling. Polled that
+process's own `%CPU`/assigned-core (`ps -o pcpu,psr`) at 50ms intervals
+throughout an N=32 hot run: max observed 10.4% CPU, hopping across 5
+different cores (5, 6, 21, 22, 23) rather than pinned to one saturated
+core. Nowhere near a bottleneck - this rules out the consumer process
+directly. (Also worth noting: `mpstat -P ALL`'s *aggregate* idle-time
+metric used in the section above cannot detect a single-core-pegged
+process at all - 1 core at 100% out of 24 only moves the aggregate to
+~95.8% idle, indistinguishable from real headroom. It happened not to
+matter here since the consumer wasn't the bottleneck, but it's a real
+blind spot in that methodology worth remembering for future single-
+threaded-process suspects.)
+
+**Differential `perf record -g -p <nats-server-pid>` at N=16 vs N=32**
+(4999Hz, attached immediately before the publish/consume hot phase,
+~131-132k samples captured per profile despite the sub-second window):
+confirms this is *the same mechanism* already found and reported for the
+unfiltered raw-transport queue-group test (commit `74f3e50`), not a new
+one specific to `nats_sidecar`'s filtering pipeline - just reached at a
+higher N here.
+
+| category | N=16 | N=32 |
+|---|---|---|
+| `(*client).flushOutbound` (per-connection socket write) | 16.68% | **21.69%** |
+| `sync.RWMutex` Lock/Unlock (lock contention) | 8.24% | 9.11% |
+| `__vdso_clock_gettime` (write-deadline bookkeeping, a `flushOutbound` child call - see below) | 2.11% | 2.77% |
+| message parse/route (`parse`, `processMsgResults*`, `processPub`, `deliverMsg` - the actual useful work) | 11.79% | 10.47% |
+| Go scheduler/GC (`lock2`/`unlock2`/`stealWork`/`findRunnable`/`mallocgc*`/`casgstatus`) | 12.36% | 9.85% |
+
+`flushOutbound` is both the largest single cost at either N *and* the
+fastest-growing one (+5 points, by far the biggest mover) - and per the
+call-graph, its own `SetWriteDeadline`→`setDeadlineImpl`→
+`runtime_pollSetDeadline` children directly explain the `clock_gettime`
+growth too, so that's not an independent new cost, it's downstream of
+the same one. Lock contention (`sync.RWMutex`) also grows modestly,
+consistent with more concurrent client connections contending for the
+same server-side locks. The "useful work" and scheduler/GC categories
+both *shrink* in relative share - not because they got cheaper in
+absolute terms, but because `flushOutbound` and lock overhead are
+eating a growing fraction of the same fixed time budget.
+
+**Conclusion: this is the identical per-connection-outbound-write
+bottleneck already identified for the unfiltered queue-group test, not
+a `nats_sidecar`-specific or `matching_engine`-specific limitation.**
+It shows up at a much higher N here (16-32 vs. 4-8 for the unfiltered
+case) because each `nats_sidecar` instance does real deserialize→filter→
+republish work between receiving and re-publishing, which paces the
+server's write frequency differently than a trivial pass-through
+consumer would - but the underlying constraint is the same NATS-server-
+side mechanism both times: `nats-server`'s per-client `flushOutbound`
+write path (and the lock contention around shared per-client state that
+grows alongside it) is the ultimate ceiling for this whole investigation,
+end to end, not anything about `matching_engine` evaluation cost,
+`nats_sidecar`'s own architecture, or this machine's hardware.
+
+Teardown confirmed clean via `ps` after every run.
