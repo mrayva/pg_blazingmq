@@ -984,3 +984,82 @@ more.
 Config changes reverted the same way as every prior section
 (`git status --short` clean in `~/blazingmq`), broker stopped, no
 leftover `pg_blazingmq subscriber` connections.
+
+## Multi-Queue Scaling: Testing BlazingMQ's Own Published Scaling Strategy — It Doesn't Help Here
+
+BlazingMQ's official benchmarks (https://bloomberg.github.io/blazingmq/docs/performance/benchmarks/)
+scale priority-mode throughput via **queue count**, not consumers per
+queue: 1Q/1P/1C → 60,000/s, 10Q/10P/10C → 120,000/s aggregate, 50Q/50P/50C
+→ 100,000/s, 100Q/100P/100C → 100,000/s (their hardware: 6-node cluster,
+strong consistency, 1KB messages — very different from this scratch
+single-node setup, but the *scaling strategy* — many independent queues,
+each with its own dedicated 1P/1C pair — is what's being tested here,
+not an exact number match). This is a genuinely different axis from
+everything tested in the sections above, which all scaled *consumers on
+one shared queue* and found it doesn't help. Multiple independent queues
+had never been tested.
+
+New script: `bench/multi_queue_bench.py`, same conventions and
+backlog-bounded-is-the-evidence discipline as `sustained_bench.py`, just
+replicated per queue — each of K queues gets its own dedicated producer
+and consumer process, its own publish/consume counters, and its own
+backlog trend, so one queue's healthy result can't mask another's
+quietly growing one.
+
+**Result: it doesn't scale here — aggregate capacity across K queues is
+*lower* than one queue alone, not higher.** Bisected per-queue rate
+against a bounded-backlog outcome, fresh broker restart per data point,
+dispatcher pools (`sessions`/`queues`/`clusters.numProcessors`,
+`tcpInterface.ioThreads`) matched to total session count (2×K) each time:
+
+| K queues | per-queue rate tested | aggregate | bounded? |
+|---|---|---|---|
+| 1 (reference, prior section) | — | ~42,000-45,000/s | yes |
+| 2 | 5,000/s | 10,000/s | yes |
+| 2 | 8,000/s | 16,000/s | **yes (K=2's real ceiling, ~here)** |
+| 2 | 12,500/s | 25,000/s | no — consume collapses to ~4,000/s aggregate |
+| 2 | 20,000/s | 40,000/s | no — consume collapses to ~4,000/s aggregate |
+| 4 | 4,000/s | 16,000/s | yes — same aggregate ceiling as K=2 |
+
+K=2 and K=4 land on the **same aggregate ceiling, ~16,000-20,000/s**,
+each well below what one queue alone sustains (~42,000-45,000/s). Not a
+step-down-then-flat curve like the earlier consumer-scaling sweep — a
+consistent aggregate cap regardless of how the work is split across
+queues, and *lower* than a single queue gets on its own. Splitting
+publish+consume load across more queues doesn't parallelize it here; it
+divides a smaller shared budget among them. Once per-queue rate is
+pushed past that shared ceiling, consume throughput collapses to a
+roughly fixed low value (~2,000/s per queue regardless of target rate)
+rather than degrading gracefully — the same collapse-under-live-contention
+shape found in the earlier 2-consumer-on-one-queue investigation, now
+appearing across queues instead of within one.
+
+**This doesn't reproduce Bloomberg's published scaling shape**, and the
+gap is worth being explicit about rather than assumed away: their
+benchmark runs on a real multi-node cluster with strong-consistency
+replication, dedicated hardware, and (implicitly) broker-side resource
+allocation this single-node scratch broker doesn't have. The most
+plausible explanation, consistent with every other finding in this
+document, is that this scratch broker's shared dispatcher/confirm-path
+resources (already implicated in both the single-queue backlog-scaling
+ceiling and the live multi-consumer collapse) are a broker-wide bottleneck
+that queue count alone doesn't route around — not a `pg_blazingmq` client
+limitation, and not proof BlazingMQ itself can't scale via queue count
+under different (real, multi-node, properly-provisioned) deployment
+conditions. Not further root-caused here (a `perf` diff between the K=2
+bounded and K=2 collapsed configurations would be the natural next step,
+not done — this section prioritized mapping the shape over explaining
+the mechanism, given remaining budget).
+
+**Revised practical answer, updated**: for this single-node scratch
+broker, ~42,000-45,000/s (one queue, one producer, one consumer, priority
+mode, `batch_confirm=true`) remains the best sustained throughput found
+across every scaling strategy tested this session — consumer count,
+connection count, and now queue count. None of them beat it. Whether a
+real multi-node BlazingMQ cluster (matching Bloomberg's own published
+setup) would show different scaling behavior is a real, open question
+this investigation's scratch-broker environment cannot answer.
+
+Config changes reverted the same way as every prior section
+(`git status --short` clean in `~/blazingmq`), broker stopped, no
+leftover `pg_blazingmq subscriber` connections.
