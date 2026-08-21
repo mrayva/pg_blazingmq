@@ -8,3 +8,4 @@ regression.out
 log/
 test/.broker_scratch/
 bmqbrkr.hist
+bench/__pycache__/
