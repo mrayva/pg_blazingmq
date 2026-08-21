@@ -1163,3 +1163,76 @@ contention too) before it could even begin filtering downstream.
 Config changes reverted the same way as every prior section
 (`git status --short` clean in `~/blazingmq`), broker stopped, no
 leftover `pg_blazingmq subscriber` connections.
+
+## NATS Core Subject-Matching Selectivity: Flat, Not Cardinality-Dependent
+
+A different, narrower question than everything above: does *NATS core's*
+own native routing mechanism (subject-hierarchy wildcard matching - the
+thing `nats_sidecar` exists because it *isn't* expressive enough for
+content-based filtering) have a selectivity-dependent cost the way
+`bmqeval` does? Every NATS benchmark elsewhere in this document used one
+fixed subject/pattern - this had never been swept.
+
+New script: `bench/nats_selectivity.py` (uses `nats-py`, a pure-Python
+asyncio client - not this repo's usual C++ `nats_tool` - so its absolute
+rates are Python-client-bound and not comparable to `nats_tool`'s own
+numbers elsewhere in this document; the controlled variable is subscriber
+*selectivity*, everything else held fixed, so relative differences across
+the sweep are the meaningful signal).
+
+Subject space: `trades.<region>.<symbol>`, 8 regions x 200 symbols = 1,600
+concrete subjects, messages cycled evenly across the whole space. One
+subscriber, swept from broadest to narrowest, against the *same* fixed
+100,000-message publish workload each time, fresh `nats-server` restart
+between configurations:
+
+| subscriber pattern | matches | publish rate | delivery lag (after publish ends) |
+|---|---|---|---|
+| (none) | — | 803,440/s | — |
+| `trades.>` (100% of traffic) | 100,000/100,000 | 784,578/s | ~127ms |
+| `trades.r0.>` (1/8 of traffic) | 12,500/12,500 | 785,931/s | ~1.8ms |
+| `trades.r0.s0` (1/1,600 of traffic) | 63/63 | 812,355/s | ~0.9ms |
+
+Content-verified throughout: `match_ok=true` at every level (received
+count exactly matches the closed-form expected count for that pattern).
+
+**Real methodological trap caught before trusting this**: a first attempt
+ran the publisher and subscriber in one Python process on one asyncio
+event loop, and measured `trades.>`'s publish rate at 281,785/s - looking
+like a real, large selectivity-dependent cost. It wasn't: with a broad
+pattern, that single process was also processing 100,000 of its own
+inbound delivery callbacks on the *same* event loop it was timing the
+publish loop on, so client-side message-handling load (which scales with
+match count) was leaking into the publish-side measurement, not
+server-side matching cost. Splitting publisher and subscriber into
+separate OS processes, each with its own connection, removed the confound
+entirely - the table above is the corrected, isolated result.
+
+**Finding: NATS core's publish-side cost is flat across selectivity, not
+cardinality-dependent.** All four publish rates (803k/785k/786k/812k) sit
+within ~4% of each other - normal run-to-run noise, not a trend. Whether
+zero subscribers are registered, or one subscriber matches 100%, 12.5%,
+or 0.06% of published traffic, the publisher pays essentially the same
+cost per message. This is consistent with NATS's subject-trie matching
+being closer to O(pattern depth) - walking the token-trie for *this one*
+published subject against registered patterns - rather than
+O(cardinality of what a pattern could match): a broad pattern isn't more
+expensive to evaluate than a narrow one, it just happens to accept more
+of what gets evaluated. (Delivery lag *does* scale, but predictably so -
+with the number of messages the subscriber actually receives and has to
+process client-side, not with pattern breadth itself: 127ms for 100,000
+deliveries vs <2ms for a few dozen.)
+
+This is a real point of contrast with the `bmqeval` finding above:
+BlazingMQ's server-side expression evaluation costs real throughput
+*regardless of match rate even for a single simple `==` check* (6.5x for
+one filtered consumer, matching 100% or not), while NATS core's native
+subject-matching mechanism shows no measurable per-publish cost at all
+for having a subscription evaluated, narrow or broad. That's not
+surprising given how differently the two mechanisms work - trie-based
+prefix/token matching on a fixed hierarchy vs. evaluating an arbitrary
+boolean expression tree against typed message properties - but it's now
+an empirically grounded difference, not an assumed one.
+
+Teardown clean: `nats-server` stopped after each configuration, no
+leftover `nats_selectivity.py` processes.
