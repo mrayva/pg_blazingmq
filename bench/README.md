@@ -773,3 +773,117 @@ eventually drain.
 
 Broker config reverted, `git status --short` clean in `~/blazingmq`,
 broker stopped, no stray processes.
+
+## A Real Sustained-Rate Benchmark (`sustained_bench.py`)
+
+Built the concurrent publish+drain benchmark the section above said didn't
+exist yet: `bench/sustained_bench.py` runs N producer processes and M
+consumer processes against the same queue simultaneously, for a fixed
+wall-clock window, and samples `(published - consumed)` every couple of
+seconds throughout the run - printed as a curve, not asserted - so a
+reader can see for themselves whether the backlog stayed bounded or grew.
+
+**Priority mode, not broadcast, and it matters why.** Broadcast fans every
+message out to *every* attached consumer independently - per this
+session's own earlier findings, each consumer gets its own copy and the
+broker must retain a message until every attached consumer has confirmed
+it. Adding more broadcast consumers doesn't parallelize draining, it
+multiplies delivery work without shrinking the backlog any faster.
+Priority mode's work-queue routing sends each message to exactly one
+attached consumer (round-robin among equal-priority consumers), so it's
+the only mode where adding consumers can actually help drain throughput.
+
+**Two real bugs in the first cut of this benchmark, found and fixed
+before trusting any number from it - not smoothed over:**
+
+1. Concurrent producers all doing their *first-ever* open of a brand-new
+   queue at the exact instant a `multiprocessing.Barrier` releases them
+   collide into `rc=100` (`ALREADY_OPENED`) - not the same-session
+   double-open case that error usually means (`get_queue()`'s cache
+   already handles repeated calls from one session fine), but a genuine
+   startup race between *different* sessions' first opens. Primed each
+   producer's queue handle with one row published before the barrier -
+   this reduced but didn't eliminate the race (per-connection setup time,
+   `SET`/`CREATE TEMP TABLE`/psycopg connect, varies enough that "before
+   the barrier" isn't reliably "not colliding with another session's
+   first open" either) - closed the remaining gap with a short randomized
+   retry-on-`rc=100` wrapper around every open-sensitive call.
+2. A consumer loop that broke out early the first time a single
+   `bmq_consume()` call returned zero rows after the producer window
+   ended - looked reasonable, but priority mode's round-robin delivery
+   means one consumer seeing `n==0` on a given call says nothing about
+   whether the *queue* is actually empty (another attached consumer could
+   have gotten that round's messages instead). This silently abandoned a
+   consumer's share of the backlog for the rest of the run the moment
+   production paused even briefly - confirmed by seeing `consumed` freeze
+   completely mid-`drain_tail` despite a large nonzero backlog still
+   sitting in the queue. Fixed by looping unconditionally until the drain
+   deadline instead of trying to detect "empty" from one call.
+
+**The core, load-bearing finding: an uncapped producer can never reach a
+sustained equilibrium with any finite consumer capacity, because
+publishing itself gets more expensive as the backlog grows** - not just
+delivery. This follows directly from the section above:
+`RootQueueEngine::afterNewMessage()`/`deliverMessage()` runs on *every*
+publish and its cost scales with retained backlog size. So a producer
+publishing flat-out and a consumer trying to keep pace aren't just racing
+at fixed speeds - the producer's own per-message cost rises as the gap
+between them widens, which only widens the gap further. Confirmed
+directly: 1 producer (unthrottled) vs 1 consumer in priority mode grows
+an ever-larger backlog no matter how the consumer side is tuned (tried
+1-4 consumers, larger/smaller `bmq_consume()` batch sizes, shorter/longer
+timeouts - backlog always grew without bound while the producer ran flat
+out).
+
+**The right experiment is therefore "what's the highest *fixed* publish
+rate at which consumption genuinely keeps the backlog flat", not "how
+fast can producers outrun consumers before falling behind".** Added
+`--producer-rate-limit` (paces each producer to a target total rows/sec
+via a per-batch sleep) and bisected it for a single producer + single
+consumer, priority mode, `batch_confirm=true` both sides, fresh broker
+per run, 12s window (3s ramp-up excluded, 8-10s drain tail to confirm
+full drain at the end):
+
+| target rate | backlog over the steady-state window | bounded? |
+|---|---|---|
+| 5,000/s | flat at ~3,400 | yes, comfortably |
+| 30,000/s | flat at ~15,000 | yes, comfortably |
+| **42,000/s** | **21,929 -> 19,088 (shrinking)** | **yes** |
+| 48,000/s | 25,113 -> 177,613 (growing) | no |
+| 60,000/s | 76,900 -> 649,900 (growing fast) | no |
+
+**Sustained throughput for pg_blazingmq (1 producer : 1 consumer,
+priority mode, Release build): ~42,000-45,000/s** - this is the number to
+actually cite for capacity planning, not the 549,407/s burst peak two
+sections up. Every run at or below 42k/s fully drained to zero backlog
+during the drain tail; every run at or above 48k/s did not (48k/s did
+eventually drain given enough tail time in this specific test, but its
+steady-state window was clearly growing, not flat - not a rate that
+holds indefinitely).
+
+**A genuinely surprising negative result, flagged rather than
+explained:** 2 consumers at a higher target rate (80,000/s) sustained
+only ~2,933/s - *worse* than 1 consumer alone managed at a lower,
+still-unsustainable 48,000/s target (29,114/s). More consumer capacity
+made things worse, not better. Not root-caused here (plausibly
+round-robin fan-out coordination overhead among multiple attached
+consumers scaling poorly with consumer count, independent of dispatcher
+thread pool availability - all runs in this section used pools sized
+generously at 8 for at most 3 concurrent sessions, so pool size isn't the
+limiter) - real scope for whoever picks this up next.
+
+**Practical implication, revised from the section above**: it's not just
+"consume promptly instead of letting a backlog build" - it's that
+*sizing your producer rate to what your actual consumer capacity can
+sustain* is the real requirement, since BlazingMQ (at least in this
+single-node, in-memory, priority-mode configuration) has no stable
+equilibrium once publish outpaces drain capacity even briefly. ~42-45k/s
+is the number to design around for this configuration, not the ~500k/s
+burst ceiling found earlier - and multi-consumer scaling is not a safe
+assumption for raising that number without further investigation.
+
+New reusable script: `bench/sustained_bench.py`. Domain/broker config
+changes made and reverted the same way as every other run in this
+document; `git status --short` in `~/blazingmq` confirmed clean, broker
+stopped, no leftover `pg_blazingmq subscriber` connections in
+`pg_stat_activity` after finishing.
