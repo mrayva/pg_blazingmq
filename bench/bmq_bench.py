@@ -44,8 +44,15 @@ def main():
     args = ap.parse_args()
     batch_confirm_sql = "true" if args.batch_confirm else "false"
 
-    attr_cols = [c.strip() for c in args.attr_columns.split(",")]
-    attr_array_sql = "ARRAY[" + ",".join(f"'{c}'" for c in attr_cols) + "]"
+    # An empty --attr-columns means "no properties at all" (explicit empty
+    # array - bmq_publish_row treats an *omitted*/NULL attr_columns as
+    # "auto-promote every eligible column", so ARRAY[]::text[] is the only
+    # way to actually suppress MessageProperties entirely).
+    if args.attr_columns.strip() == "":
+        attr_array_sql = "ARRAY[]::text[]"
+    else:
+        attr_cols = [c.strip() for c in args.attr_columns.split(",")]
+        attr_array_sql = "ARRAY[" + ",".join(f"'{c}'" for c in attr_cols) + "]"
 
     with psycopg.connect(args.dsn, autocommit=True) as conn:
         with conn.cursor() as cur:

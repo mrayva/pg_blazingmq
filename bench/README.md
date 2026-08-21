@@ -119,3 +119,52 @@ combined read+write flags on the very first `bmq_publish_row()` call, so
 the read side is established before any message is published and this
 script needed no changes to work correctly under broadcast mode; verified
 via a 50-row dry run before the full 100k run.)
+
+## Broadcast + batch_confirm combined, and a properties-free isolation
+
+Broadcast mode and `batch_confirm` are independent wins (queue-mode
+bookkeeping vs. confirm-protocol overhead) and hadn't been tested
+together. On a **freshly restarted broker**, combining them reaches
+**81,623/s receive** - the best number measured so far, though still well
+below NATS core's 221,868/s.
+
+The next hypothesis was that `bmq_publish_row`'s per-message
+`MessageProperties` (`--attr-columns`) were themselves adding encoding/
+decoding overhead independent of queue mode or confirmation, since NATS
+core has no equivalent concept at all. `--attr-columns ""` (added to
+`bmq_bench.py` - an *empty* array, not `NULL`: passing `NULL`/omitting
+the argument means "auto-promote every eligible column", not "no
+properties" - `bmq_publish_row`'s `attrs_explicit` flag only suppresses
+promotion given an *explicit* empty array) tests this directly.
+
+**Result: the opposite of the hypothesis.** On matched fresh-broker runs:
+
+| variant | publish rate | receive rate |
+|---|---|---|
+| broadcast + batch_confirm, **with** properties | 58,063/s | **81,623/s** |
+| broadcast + batch_confirm, **without** properties | 99,133/s | 46,121/s |
+
+Removing properties nearly doubles *publish* rate (less to encode, as
+expected) but *receive* rate drops by nearly half instead of improving.
+Property-encoding is not the remaining bottleneck on the receive side -
+if anything, its presence correlates with faster delivery, plausibly
+because it changes how the broker batches messages into `bmqa::Event`s
+per `nextEvent()` call (unconfirmed - would need broker-side
+instrumentation to prove, out of scope here).
+
+**A separate, important methodology finding surfaced while chasing this
+down**: repeated benchmark runs against the *same* broker process
+degrade significantly - a first run against a freshly started broker
+consistently lands around 81-99k/s, while a second run immediately after
+(different queue URI, same broker, same variant) drops to 35-46k/s,
+regardless of which variant is tested. This is a real confound for *any*
+future pg_blazingmq benchmarking in this repo: comparisons across
+variants are only trustworthy with a **fresh broker restart between each
+one** - back-to-back runs in one broker session are not a fair
+comparison, since broker-session state accumulation dominates the
+variance far more than the variable actually being tested. All numbers
+in this section used a fresh restart per variant; the numbers earlier in
+this file (broadcast-mode section, batch_confirm section) were not
+controlled this way and may be understating both variants somewhat
+consistently, though the *relative* comparisons in each of those
+sections held up under an immediate same-broker re-test.
