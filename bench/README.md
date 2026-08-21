@@ -1063,3 +1063,103 @@ this investigation's scratch-broker environment cannot answer.
 Config changes reverted the same way as every prior section
 (`git status --short` clean in `~/blazingmq`), broker stopped, no
 leftover `pg_blazingmq subscriber` connections.
+
+## Filtered Consumption (`bmqeval`) Under Load
+
+Every benchmark above calls `bmq_consume()` with `subscription_expr=NULL`
+(verified via `grep bmq_consume( bench/*.py` before starting this
+section) - none of them ever exercised BlazingMQ's native `bmqeval`
+server-side filtering under real load. This matters directly: the
+argument that pg_blazingmq doesn't need a `nats_sidecar`-equivalent
+bolt-on (`bmqeval` already provides native, broker-evaluated content
+filtering) had only ever been made from architecture/docs, never
+measured. `PROFILING.md`'s "zero `bmqeval`/`SimpleEvaluator` occurrences"
+finding is not evidence filtering is cheap - it's simply that filtering
+was never invoked in any prior test.
+
+New script: `bench/filtered_bench.py`, same bisection/backlog-curve
+methodology as `sustained_bench.py`, but each consumer gets its own
+`subscription_expr` instead of `NULL`. Fixture: `nyse_eqy_us_all_trade_
+20260102`'s `Trade Through Exempt Indicator` column (bigint, eligible as
+an `int8` property, real ~68%/32% split between values 0 and 1) aliased
+to a plain identifier `texi` in the source query - `bmqeval` rejects
+quoted/spaced identifiers outright (`'"Trade Through Exempt Indicator"
+== 0'` fails validation with "expression does not use any properties",
+even though the column publishes fine as a property under its real
+name) - unrelated to the actual question, just a syntax fact worth
+knowing before writing a `subscription_expr`.
+
+**Single filtered consumer, isolating pure evaluation cost**: producer
+publishes only `texi=0` rows (100% match rate, so the comparison isolates
+"cost of having an active subscription filter", not "consumer receives
+fewer messages"), one consumer with `subscription_expr = "texi == 0"`.
+Bisected the same way as every other sustained number in this document:
+
+| producer rate | backlog trend | bounded? |
+|---|---|---|
+| 2,200/s | flat (~1,000-2,900) | yes |
+| 6,500/s | flat (~1,100-3,000), drains to near-zero after | **yes - the real ceiling** |
+| 9,000/s | grows during steady state, recovers only in drain tail | no |
+| 15,000/s | grows steadily, never recovers | no |
+| 43,000/s (matching the unfiltered baseline) | runs away to 1.8M+ | no |
+
+**Real single-consumer filtered ceiling: ~6,500/s, vs ~42,000-45,000/s
+unfiltered - roughly a 6.5x cost for evaluating one simple `==`
+expression against every published message.** This is a genuine,
+substantial per-message cost, not noise - the 43,000/s attempt (same
+rate as the unfiltered baseline) collapsed by more than an order of
+magnitude, and even at 15,000/s (barely a third of the unfiltered rate)
+the backlog never stabilized.
+
+**Two consumers, distinct filters, realistic mixed traffic** (the actual
+`nats_sidecar`-equivalent shape: multiple downstream consumers each
+interested in a different content subset of the same stream) - producer
+publishes a real mix of both `texi` values, consumer 0 filters
+`texi == 0`, consumer 1 filters `texi == 1`:
+
+| producer rate | backlog trend | bounded? |
+|---|---|---|
+| 4,000/s | flat (~1,600-3,300), drains after | yes |
+| 6,000/s | grows steadily (4,611→10,531 in steady window) | no |
+
+**Real 2-consumer filtered aggregate ceiling: ~4,000-5,000/s.** Content
+verified throughout (`--verify-content`: each consumer's received
+payloads checked against its own expected filter value; 0 mismatches
+across every run) - the filtering is working correctly, this isn't a
+routing bug inflating or deflating the numbers.
+
+**The genuinely interesting comparison**: this ~4,000-5,000/s filtered
+2-consumer number is *close to, not dramatically worse than*, the
+already-established ~3,999/s unfiltered 2-consumer collapse (`README.md`'s
+consumer-scaling section, commit `1336b78` - live-publish contention
+between round-robin consumers on one queue). Filtering and multi-consumer
+contention don't compound multiplicatively here; both roughly land on
+the same order-of-magnitude ceiling independently. That's consistent
+with a shared root cause rather than two independent, additive costs -
+plausibly the same broker-side dispatcher/evaluation path handles both
+"deciding which of several round-robin consumers gets a message" and
+"deciding whether a subscribed consumer's filter matches a message",
+though this session didn't `perf`-profile the filtered case to confirm
+that directly (real, additional scope, not done here).
+
+**Revised answer to "do we need a `bmq_sidecar`"**: bmqeval filtering is
+real, correct, and does exactly what a `nats_sidecar`-equivalent would
+need to do - but it is not free. At ~6,500/s (1 filtered consumer) to
+~4,000-5,000/s (2 filtered consumers with distinct expressions) vs
+~42,000-45,000/s unfiltered, native filtering costs roughly 6-10x
+throughput on this scratch broker. Whether that's an acceptable price
+depends entirely on the actual required rate - for any workload under a
+few thousand messages/sec, native `bmqeval` filtering is still clearly
+the right choice over an external sidecar (avoids an extra process, an
+extra network hop, and the deserialize/re-evaluate/republish overhead a
+sidecar would add on top of *its own* consume path). For a workload that
+genuinely needs tens of thousands of filtered messages/sec, this number
+says native filtering alone may not get there on this single-node broker
+shape - though a sidecar wouldn't obviously do better, since it would
+still have to consume the *unfiltered* stream at whatever the base
+unfiltered ceiling is (already found to collapse under multi-consumer
+contention too) before it could even begin filtering downstream.
+
+Config changes reverted the same way as every prior section
+(`git status --short` clean in `~/blazingmq`), broker stopped, no
+leftover `pg_blazingmq subscriber` connections.
