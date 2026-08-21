@@ -1655,3 +1655,59 @@ same `subprocess.Popen`/`.terminate()` discipline as the other N-sweep
 scripts in this directory) and `mq_bench_driver.cpp`'s new `subfield`
 mode (additive only). Teardown confirmed clean via `ps` after the full
 sweep.
+
+## Extending To N=16/32: Does Scaling Keep Climbing, Plateau, Or Decline?
+
+Every `nats_sidecar`-with-real-filtering run above (synthetic and real
+NYSE data alike) stopped at N=8. The separate raw-NATS-transport-only
+queue-group test (no `nats_sidecar`, no filtering) went to N=32 and
+found a different shape - peaked at N=4, then declined gently and
+monotonically out to N=32. Worth checking which shape the real
+filtering pipeline follows past N=8, rather than assuming either one.
+
+Same fixture/architecture as the real-data section directly above
+(`sc_bench_sample`, `Exchange == "N"`, ground truth 21,683/200,000), but
+`--workers` had to be reduced from the `2`-per-instance used at N≤8 -
+this machine has 24 hardware threads, and 16 or 32 instances × 2
+workers each would mean 32-64 dedicated worker threads before even
+counting `nats-server`, the publisher, and the consumer. Used
+`--workers 1` at both N=16 and N=32 (new script,
+`bench/nats_sidecar_scaling_real_data_ext.py`, same `Popen`/`.terminate()`
+discipline as the rest of this directory). `mpstat -P ALL` run
+concurrently with the hot publish/consume phase at both N, specifically
+to distinguish "real algorithmic ceiling" from "this machine ran out of
+cores" rather than assume either. Two full passes run to check the
+result wasn't noise from the very short (<1s) hot window - reproduced
+closely both times (N=16: 25,601/25,571; N=32: 25,307/25,020, each
+pair within ~1-2%).
+
+| N | workers | filtered rate (matches/s) | scaling vs N=1 | correctness | mpstat (all-core %idle, hot window) |
+|---|---|---|---|---|---|
+| 1 | 2 | 2,798/s | 1.00x | 21,683/21,683, 0 wrong | — |
+| 2 | 2 | 5,453/s | 1.95x | 21,683/21,683, 0 wrong | — |
+| 4 | 2 | 9,379/s | 3.35x | 21,683/21,683, 0 wrong | — |
+| 8 | 2 | 18,174/s | 6.49x | 21,683/21,683, 0 wrong | — |
+| 16 | 1 | ~25,570/s | ~9.14x | 21,683/21,683, 0 wrong | min=51.3 avg=83.5 max=99.8 (n=3) |
+| 32 | 1 | ~25,020-25,307/s | ~8.94x | 21,683/21,683, 0 wrong | min=50.4 avg=82.6-83.2 max=99.2-99.6 (n=3, both passes) |
+
+**Scaling keeps climbing from N=8 to N=16 (6.49x → ~9.14x), then
+plateaus from N=16 to N=32 (~9.14x → ~8.94x - flat within the run-to-run
+noise observed, not a real decline).** This is a third shape, distinct
+from both reference points: it doesn't keep accelerating indefinitely,
+but it also doesn't decline the way the unfiltered raw-transport test
+did past N=4 - it climbs further (to N=16) before leveling off.
+
+**Critically, `mpstat` proves the N=16→32 plateau is *not* this machine
+running out of CPU.** Even at the single busiest 1-second sample across
+both N and both passes, aggregate idle time across all 24 hardware
+threads never dropped below ~50% - meaning at minimum half the
+machine's total CPU capacity was still unused at the worst moment
+measured, at both N=16 and N=32. Whatever caps throughput between N=16
+and N=32 is a software/architectural ceiling (plausibly the same class
+of NATS-transport-level effect - per-connection socket write cost, Go
+scheduler/GC pressure - that capped the unfiltered queue-group test,
+just reached at a higher N here because each `nats_sidecar` instance
+does real filtering work in between, changing the pacing) - not
+evidence that this hardware needs to be bigger to go further.
+
+Teardown confirmed clean via `ps` after every run, both passes.
