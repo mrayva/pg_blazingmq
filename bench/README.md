@@ -500,23 +500,41 @@ fair comparison point):
 
 | connections | count | publish rate |
 |---|---|---|
-| 1 | 100,000 | 150,830/s |
+| 1 | 100,000 | 153,610/s |
+| 4 | 100,000 | 138,504/s |
+| 16 | 100,000 | 126,743/s |
 
 Matches the Postgres-driven JetStream publish rate (~151k/s) almost
-exactly - Postgres wasn't a bottleneck on this side either. **A `nats_tool
-bench --js` counting bug was found at scale**, worth flagging for
-`nats_asio` separately from this benchmark: at `--count 1000000` (both
-with and without `--no_ack`), the periodic `Stats:` lines report a
-plausible, sustained ~100-150k events/sec for the full run duration, but
-the final "Messages: N" summary reports a much smaller N (93,878 and
-16,079 respectively) than the requested count or than the sustained
-per-tick rate implies - the run exits early without publishing (or without
-correctly counting) the full requested count. Not investigated further
-here (out of scope for a benchmark task); the 100,000-count run above
-completed cleanly and is the trustworthy number. N=4/N=16 JetStream
-parallelism numbers were not obtained because of this - would need the
-counting bug fixed first, or count kept at 100,000 with connections
-splitting that total instead of multiplying it.
+exactly at N=1 - Postgres wasn't a bottleneck on this side either.
+Throughput *decreases* as connections increase (opposite of BlazingMQ's
+own modest 1->4 scaling above) - all connections publish to the same
+single stream, so this looks like server-side write-serialization
+contention on that stream growing with concurrent producers, not a
+client-side limit.
+
+**The `nats_tool bench --js` counting bug flagged in an earlier version of
+this section has been root-caused and fixed, in `nats_asio` itself**
+(`samples/modes/benchmarker.hpp`, uncommitted local fix pending a
+maintainer decision - see below): `worker::m_counter` is `exchange(0,
+...)`'d every `stats_interval` seconds by the periodic `Stats:` timer -
+correct for that line's own per-interval delta, but `benchmarker::run()`'s
+final summary read `total_msgs` from that *same* being-reset counter
+instead of keeping its own running total. Any run spanning more than one
+stats tick (i.e. anything slower than ~1 stats_interval - core-NATS mode
+looked "correct" purely because it always finishes before the first
+reset) had almost its entire count zeroed out before the final read,
+leaving only whatever accumulated in the last partial interval - not a
+publish failure or early exit, a pure reporting bug. Fixed by adding a
+separate `std::atomic<std::size_t> m_total_counter` that every `run_*()`
+loop increments alongside `m_counter`, read at the end instead. Verified:
+`--count 1000000` (fresh `nats-server` restart) now reports "Messages:
+1000000 in 8.87s, Throughput: 112689 msgs/sec" - matching the sustained
+Stats-line rate, not a truncated fraction of it. The N=1/4/16 numbers
+above were obtained with this fix in place. `nats_asio` doesn't have the
+same standing push authorization established elsewhere this session for
+`pg_blazingmq`/`nats_sidecar` - the fix is verified locally
+(`samples/modes/benchmarker.hpp`) but intentionally left uncommitted/
+unpushed there pending a maintainer decision.
 
 **Bottom line**: going around Postgres didn't change the ceiling on
 either system's durable/comparable path (JetStream) - Postgres was never
