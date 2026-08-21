@@ -1,0 +1,901 @@
+#pragma once
+#include <cstdint>
+#include <cstddef>
+#include <bit>
+#include <cstring>
+#include <cstdlib>
+#include <string>
+#include <string_view>
+#include <vector>
+#include <set>
+#include <span>
+#include <stdexcept>
+#include <sstream>
+#include <iterator>
+#include <type_traits>
+
+#include <msgpack.h> // for the writer
+#include <zerialize/zbuffer.hpp>
+#include <zerialize/errors.hpp>
+
+
+namespace zerialize {
+
+// ===== helpers (big-endian readers) ==========================================
+inline uint16_t mp_read_be16(const uint8_t* p) {
+    return (uint16_t(p[0]) << 8) | uint16_t(p[1]);
+}
+inline uint32_t mp_read_be32(const uint8_t* p) {
+    return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | uint32_t(p[3]);
+}
+inline uint64_t mp_read_be64(const uint8_t* p) {
+    return (uint64_t(p[0]) << 56) | (uint64_t(p[1]) << 48) | (uint64_t(p[2]) << 40) | (uint64_t(p[3]) << 32) |
+           (uint64_t(p[4]) << 24) | (uint64_t(p[5]) << 16) | (uint64_t(p[6]) << 8) | uint64_t(p[7]);
+}
+
+// Forward decl
+inline size_t mp_skip(std::span<const uint8_t>);
+
+// ===== minimal element skipper (for iterators / indexing) ====================
+inline size_t mp_skip(std::span<const uint8_t> v) {
+    if (v.empty()) throw DeserializationError("msgpack: empty in skip");
+    const uint8_t m = v[0];
+
+    // Single byte: nil/bool/fixint/neg fixint
+    if ((m <= 0x7f) || (m >= 0xe0) || m == 0xc0 || m == 0xc2 || m == 0xc3) return 1;
+
+    // fixstr
+    if ((m & 0xe0) == 0xa0) {
+        size_t len = 1 + (size_t)(m & 0x1f);
+        if (len > v.size()) throw DeserializationError("msgpack: truncated fixstr");
+        return len;
+    }
+    // fixarray
+    if ((m & 0xf0) == 0x90) {
+        size_t n = m & 0x0f, off = 1;
+        for (size_t i = 0; i < n; ++i) { auto s = mp_skip(v.subspan(off)); off += s; }
+        return off;
+    }
+    // fixmap
+    if ((m & 0xf0) == 0x80) {
+        size_t n = m & 0x0f, off = 1;
+        for (size_t i = 0; i < n; ++i) {
+            auto ks = mp_skip(v.subspan(off)); off += ks;
+            auto vs = mp_skip(v.subspan(off)); off += vs;
+        }
+        return off;
+    }
+
+    switch (m) {
+        // ints / floats
+        case 0xcc: case 0xd0: if (v.size() < 2) throw DeserializationError("msgpack: truncated"); return 2;
+        case 0xcd: case 0xd1: if (v.size() < 3) throw DeserializationError("msgpack: truncated"); return 3;
+        case 0xce: case 0xd2: case 0xca: if (v.size() < 5) throw DeserializationError("msgpack: truncated"); return 5;
+        case 0xcf: case 0xd3: case 0xcb: if (v.size() < 9) throw DeserializationError("msgpack: truncated"); return 9;
+
+        // str - the header check only proves the length prefix itself fits;
+        // the resulting total must also be checked against the payload.
+        case 0xd9: { if (v.size() < 2) throw DeserializationError("str8");  size_t len = 2 + (size_t)v[1]; if (len > v.size()) throw DeserializationError("msgpack: truncated str8"); return len; }
+        case 0xda: { if (v.size() < 3) throw DeserializationError("str16"); size_t len = 3 + (size_t)mp_read_be16(v.data()+1); if (len > v.size()) throw DeserializationError("msgpack: truncated str16"); return len; }
+        case 0xdb: { if (v.size() < 5) throw DeserializationError("str32"); size_t len = 5 + (size_t)mp_read_be32(v.data()+1); if (len > v.size()) throw DeserializationError("msgpack: truncated str32"); return len; }
+
+        // bin
+        case 0xc4: { if (v.size() < 2) throw DeserializationError("bin8");  size_t len = 2 + (size_t)v[1]; if (len > v.size()) throw DeserializationError("msgpack: truncated bin8"); return len; }
+        case 0xc5: { if (v.size() < 3) throw DeserializationError("bin16"); size_t len = 3 + (size_t)mp_read_be16(v.data()+1); if (len > v.size()) throw DeserializationError("msgpack: truncated bin16"); return len; }
+        case 0xc6: { if (v.size() < 5) throw DeserializationError("bin32"); size_t len = 5 + (size_t)mp_read_be32(v.data()+1); if (len > v.size()) throw DeserializationError("msgpack: truncated bin32"); return len; }
+
+        // arrays
+        case 0xdc: {
+            if (v.size() < 3) throw DeserializationError("array16");
+            size_t n = mp_read_be16(v.data()+1), off = 3;
+            for (size_t i=0;i<n;++i){ auto s=mp_skip(v.subspan(off)); off+=s; } return off;
+        }
+        case 0xdd: {
+            if (v.size() < 5) throw DeserializationError("array32");
+            size_t n = mp_read_be32(v.data()+1), off = 5;
+            for (size_t i=0;i<n;++i){ auto s=mp_skip(v.subspan(off)); off+=s; } return off;
+        }
+
+        // maps
+        case 0xde: {
+            if (v.size() < 3) throw DeserializationError("map16");
+            size_t n = mp_read_be16(v.data()+1), off = 3;
+            for (size_t i=0;i<n;++i){ auto ks=mp_skip(v.subspan(off)); off+=ks; auto vs=mp_skip(v.subspan(off)); off+=vs; } return off;
+        }
+        case 0xdf: {
+            if (v.size() < 5) throw DeserializationError("map32");
+            size_t n = mp_read_be32(v.data()+1), off = 5;
+            for (size_t i=0;i<n;++i){ auto ks=mp_skip(v.subspan(off)); off+=ks; auto vs=mp_skip(v.subspan(off)); off+=vs; } return off;
+        }
+        default: break;
+    }
+    throw DeserializationError("msgpack: unsupported marker");
+}
+
+// ===== Deserializer ==========================================================
+class MsgPackDeserializer {
+    // root ownership if constructed from bytes/vector
+    std::vector<uint8_t> owned_;
+    // view over current element
+    std::span<const uint8_t> view_{};
+
+    // helpers: decode headers. Every branch must validate the bytes it reads
+    // exist in v before reading them (both the length prefix itself, and -
+    // for str/bin - the payload the prefix claims), otherwise a truncated
+    // marker reads past the end of v.
+    static void str_info(std::span<const uint8_t> v, const uint8_t*& p, size_t& len) {
+        if (v.empty()) throw DeserializationError("msgpack: not a string");
+        const uint8_t m = v[0];
+        if ((m & 0xe0) == 0xa0) { len = (m & 0x1f); p = v.data()+1; if (1+len > v.size()) throw DeserializationError("msgpack: truncated fixstr"); return; }
+        if (m == 0xd9) { if (v.size() < 2) throw DeserializationError("msgpack: truncated str8"); len = v[1]; p=v.data()+2; if (2+len > v.size()) throw DeserializationError("msgpack: truncated str8"); return; }
+        if (m == 0xda) { if (v.size() < 3) throw DeserializationError("msgpack: truncated str16"); len = mp_read_be16(v.data()+1); p=v.data()+3; if (3+len > v.size()) throw DeserializationError("msgpack: truncated str16"); return; }
+        if (m == 0xdb) { if (v.size() < 5) throw DeserializationError("msgpack: truncated str32"); len = mp_read_be32(v.data()+1); p=v.data()+5; if (5+(size_t)len > v.size()) throw DeserializationError("msgpack: truncated str32"); return; }
+        throw DeserializationError("msgpack: not a string");
+    }
+    static void bin_info(std::span<const uint8_t> v, const uint8_t*& p, size_t& len) {
+        if (v.empty()) throw DeserializationError("msgpack: not a bin");
+        const uint8_t m = v[0];
+        if (m == 0xc4) { if (v.size() < 2) throw DeserializationError("msgpack: truncated bin8"); len = v[1]; p=v.data()+2; if (2+len > v.size()) throw DeserializationError("msgpack: truncated bin8"); return; }
+        if (m == 0xc5) { if (v.size() < 3) throw DeserializationError("msgpack: truncated bin16"); len = mp_read_be16(v.data()+1); p=v.data()+3; if (3+len > v.size()) throw DeserializationError("msgpack: truncated bin16"); return; }
+        if (m == 0xc6) { if (v.size() < 5) throw DeserializationError("msgpack: truncated bin32"); len = mp_read_be32(v.data()+1); p=v.data()+5; if (5+(size_t)len > v.size()) throw DeserializationError("msgpack: truncated bin32"); return; }
+        throw DeserializationError("msgpack: not a bin");
+    }
+    static void arr_info(std::span<const uint8_t> v, size_t& count, size_t& off) {
+        if (v.empty()) throw DeserializationError("msgpack: not an array");
+        const uint8_t m = v[0];
+        if ((m & 0xf0) == 0x90) { count = (m & 0x0f); off = 1; return; }
+        if (m == 0xdc) { if (v.size() < 3) throw DeserializationError("msgpack: truncated array16"); count = mp_read_be16(v.data()+1); off = 3; return; }
+        if (m == 0xdd) { if (v.size() < 5) throw DeserializationError("msgpack: truncated array32"); count = mp_read_be32(v.data()+1); off = 5; return; }
+        throw DeserializationError("msgpack: not an array");
+    }
+    static void map_info(std::span<const uint8_t> v, size_t& count, size_t& off) {
+        if (v.empty()) throw DeserializationError("msgpack: not a map");
+        const uint8_t m = v[0];
+        if ((m & 0xf0) == 0x80) { count = (m & 0x0f); off = 1; return; }
+        if (m == 0xde) { if (v.size() < 3) throw DeserializationError("msgpack: truncated map16"); count = mp_read_be16(v.data()+1); off = 3; return; }
+        if (m == 0xdf) { if (v.size() < 5) throw DeserializationError("msgpack: truncated map32"); count = mp_read_be32(v.data()+1); off = 5; return; }
+        throw DeserializationError("msgpack: not a map");
+    }
+
+    // pretty printer
+    static std::string esc(std::string_view s) {
+        std::string out; out.reserve(s.size()+4);
+        for (unsigned char ch : s) {
+            switch (ch){
+                case '"': out+="\\\""; break; case '\\': out+="\\\\"; break;
+                case '\b': out+="\\b"; break; case '\f': out+="\\f"; break;
+                case '\n': out+="\\n"; break; case '\r': out+="\\r"; break;
+                case '\t': out+="\\t"; break;
+                default:
+                    if (ch < 0x20) { char b[7]; std::snprintf(b,sizeof(b),"\\u%04x",ch); out+=b; }
+                    else out.push_back(char(ch));
+            }
+        } return out;
+    }
+    static const char* tname(const MsgPackDeserializer& v) {
+        if (v.isNull()) return "null";
+        if (v.isBool()) return "bool";
+        if (v.isInt())  return "int";
+        if (v.isUInt()) return "uint";
+        if (v.isFloat())return "float";
+        if (v.isString())return "str";
+        if (v.isBlob()) return "bin";
+        if (v.isMap())  return "map";
+        if (v.isArray())return "arr";
+        return "any";
+    }
+    static void dump(std::ostringstream& os, const MsgPackDeserializer& v, int pad) {
+        auto ind = [&](int n){ for(int i=0;i<n;++i) os.put(' '); };
+        if (v.isNull()) { os << "null: null"; return; }
+        if (v.isBool()) { os << "bool: " << (v.asBool()?"true":"false"); return; }
+        if (v.isInt())  { os << "int: "  << v.asInt64(); return; }
+        if (v.isUInt()) { os << "uint: " << v.asUInt64(); return; }
+        if (v.isFloat()){ os << "float: " << v.asDouble(); return; }
+        if (v.isString()){ auto sv=v.asStringView(); os << "str: \""<<esc(sv)<<"\""; return; }
+        if (v.isBlob()){ auto b=v.asBlob(); os << "bin[size="<<b.size()<<"]"; return; }
+        if (v.isMap()){
+            os << "map {\n";
+            size_t n=0, off=0; v.map_info(v.view_, n, off);
+            for(size_t i=0;i<n;++i){
+                MsgPackDeserializer k(v.view_.subspan(off, mp_skip(v.view_.subspan(off))));
+                off += mp_skip(v.view_.subspan(off));
+                MsgPackDeserializer val(v.view_.subspan(off, mp_skip(v.view_.subspan(off))));
+                off += mp_skip(v.view_.subspan(off));
+                ind(pad+2);
+                os << '"' << esc(k.asStringView()) << "\": ";
+                dump(os, val, pad+2);
+                if (i+1<n) os << ',';
+                os << '\n';
+            }
+            ind(pad); os << '}';
+            return;
+        }
+        if (v.isArray()){
+            os << "arr [\n";
+            size_t n=0, off=0; v.arr_info(v.view_, n, off);
+            for(size_t i=0;i<n;++i){
+                MsgPackDeserializer e(v.view_.subspan(off, mp_skip(v.view_.subspan(off))));
+                off += mp_skip(v.view_.subspan(off));
+                ind(pad+2); dump(os, e, pad+2);
+                if (i+1<n) os << ',';
+                os << '\n';
+            }
+            ind(pad); os << ']';
+            return;
+        }
+        os << tname(v);
+    }
+
+public:
+    // ---- ctors ----
+    MsgPackDeserializer() = default;
+
+    // Non-owning view constructor (zero-copy): caller must keep `bytes` alive.
+    explicit MsgPackDeserializer(std::span<const uint8_t> bytes)
+      : view_(bytes) {}
+
+    // Owning constructor: makes an internal copy of `bytes` so views remain valid.
+    struct CopyTag {};
+    explicit MsgPackDeserializer(std::span<const uint8_t> bytes, CopyTag)
+      : owned_(bytes.begin(), bytes.end()), view_(owned_) {}
+
+    static MsgPackDeserializer copy_from(std::span<const uint8_t> bytes) {
+        return MsgPackDeserializer(bytes, CopyTag{});
+    }
+
+    explicit MsgPackDeserializer(const std::vector<uint8_t>& buf)
+      : owned_(buf), view_(owned_) {}
+
+    explicit MsgPackDeserializer(std::vector<uint8_t>&& buf)
+      : owned_(std::move(buf)), view_(owned_) {}
+
+    // subview ctor
+    explicit MsgPackDeserializer(std::span<const uint8_t> sub, bool /*tag*/) : view_(sub) {}
+
+    // ---- type predicates ----
+    bool isNull()  const { return !view_.empty() && view_[0] == 0xc0; }
+    bool isBool()  const { return !view_.empty() && (view_[0] == 0xc2 || view_[0] == 0xc3); }
+    bool isInt()   const {
+        if (view_.empty()) return false;
+        uint8_t m=view_[0]; return (m <= 0x7f) || (m >= 0xe0) || (m==0xd0||m==0xd1||m==0xd2||m==0xd3);
+    }
+    bool isUInt()  const {
+        if (view_.empty()) return false;
+        uint8_t m=view_[0]; return (m <= 0x7f) || (m==0xcc||m==0xcd||m==0xce||m==0xcf);
+    }
+    bool isFloat() const { if (view_.empty()) return false; uint8_t m=view_[0]; return m==0xca||m==0xcb; }
+    bool isString()const {
+        if (view_.empty()) return false; uint8_t m=view_[0];
+        return ((m & 0xe0) == 0xa0) || m==0xd9 || m==0xda || m==0xdb;
+    }
+    bool isBlob()  const { if (view_.empty()) return false; uint8_t m=view_[0]; return m==0xc4||m==0xc5||m==0xc6; }
+    bool isArray() const {
+        if (view_.empty()) return false; uint8_t m=view_[0];
+        return ((m & 0xf0) == 0x90) || m==0xdc || m==0xdd;
+    }
+    bool isMap()   const {
+        if (view_.empty()) return false; uint8_t m=view_[0];
+        return ((m & 0xf0) == 0x80) || m==0xde || m==0xdf;
+    }
+
+    // ---- scalar access ----
+    std::int8_t asInt8() const {
+        auto val = asInt64();
+        if (val < std::numeric_limits<std::int8_t>::min() || val > std::numeric_limits<std::int8_t>::max()) {
+            throw DeserializationError("int8 out of range");
+        }
+        return static_cast<std::int8_t>(val);
+    }
+    
+    std::int16_t asInt16() const {
+        auto val = asInt64();
+        if (val < std::numeric_limits<std::int16_t>::min() || val > std::numeric_limits<std::int16_t>::max()) {
+            throw DeserializationError("int16 out of range");
+        }
+        return static_cast<std::int16_t>(val);
+    }
+    
+    std::int32_t asInt32() const {
+        auto val = asInt64();
+        if (val < std::numeric_limits<std::int32_t>::min() || val > std::numeric_limits<std::int32_t>::max()) {
+            throw DeserializationError("int32 out of range");
+        }
+        return static_cast<std::int32_t>(val);
+    }
+    
+    std::int64_t asInt64() const {
+        if (view_.empty()) throw DeserializationError("int64");
+        uint8_t m=view_[0];
+        if (m <= 0x7f) return int64_t(m);
+        if (m >= 0xe0) return int8_t(m);
+        if (m==0xd0){ if(view_.size()<2) throw DeserializationError("i8");  return int8_t(view_[1]); }
+        if (m==0xd1){ if(view_.size()<3) throw DeserializationError("i16"); return int16_t(mp_read_be16(view_.data()+1)); }
+        if (m==0xd2){ if(view_.size()<5) throw DeserializationError("i32"); return int32_t(mp_read_be32(view_.data()+1)); }
+        if (m==0xd3){ if(view_.size()<9) throw DeserializationError("i64"); return int64_t(mp_read_be64(view_.data()+1)); }
+        // unsigned widths:
+        if (m==0xcc){ if(view_.size()<2) throw DeserializationError("u8");  return uint8_t(view_[1]); }
+        if (m==0xcd){ if(view_.size()<3) throw DeserializationError("u16"); return uint16_t(mp_read_be16(view_.data()+1)); }
+        if (m==0xce){ if(view_.size()<5) throw DeserializationError("u32"); return uint32_t(mp_read_be32(view_.data()+1)); }
+        if (m==0xcf){ if(view_.size()<9) throw DeserializationError("u64"); return uint64_t(mp_read_be64(view_.data()+1)); }
+        throw DeserializationError("not int");
+    }
+    
+    std::uint8_t asUInt8() const {
+        auto val = asUInt64();
+        if (val > std::numeric_limits<std::uint8_t>::max()) {
+            throw DeserializationError("uint8 out of range");
+        }
+        return static_cast<std::uint8_t>(val);
+    }
+    
+    std::uint16_t asUInt16() const {
+        auto val = asUInt64();
+        if (val > std::numeric_limits<std::uint16_t>::max()) {
+            throw DeserializationError("uint16 out of range");
+        }
+        return static_cast<std::uint16_t>(val);
+    }
+    
+    std::uint32_t asUInt32() const {
+        auto val = asUInt64();
+        if (val > std::numeric_limits<std::uint32_t>::max()) {
+            throw DeserializationError("uint32 out of range");
+        }
+        return static_cast<std::uint32_t>(val);
+    }
+    
+    std::uint64_t asUInt64() const {
+        if (view_.empty()) throw DeserializationError("uint64");
+        uint8_t m=view_[0];
+        if (m <= 0x7f) return m;
+        if (m==0xcc){ if(view_.size()<2) throw DeserializationError("u8");  return uint8_t(view_[1]); }
+        if (m==0xcd){ if(view_.size()<3) throw DeserializationError("u16"); return mp_read_be16(view_.data()+1); }
+        if (m==0xce){ if(view_.size()<5) throw DeserializationError("u32"); return mp_read_be32(view_.data()+1); }
+        if (m==0xcf){ if(view_.size()<9) throw DeserializationError("u64"); return mp_read_be64(view_.data()+1); }
+        // fall back for signed fix/neg
+        return uint64_t(asInt64());
+    }
+    
+    float asFloat() const {
+        return static_cast<float>(asDouble());
+    }
+    
+    double asDouble() const {
+        if (!isFloat()) throw DeserializationError("not float");
+        uint8_t m=view_[0];
+        if (m==0xca){ if(view_.size()<5) throw DeserializationError("f32"); uint32_t bits=mp_read_be32(view_.data()+1); float f; std::memcpy(&f,&bits,4); return double(f); }
+        if (m==0xcb){ if(view_.size()<9) throw DeserializationError("f64"); uint64_t bits=mp_read_be64(view_.data()+1); double d; std::memcpy(&d,&bits,8); return d; }
+        throw DeserializationError("float?");
+    }
+    
+    bool asBool() const { if (!isBool()) throw DeserializationError("not bool"); return view_[0]==0xc3; }
+
+    std::string      asString()     const { auto sv = asStringView(); return std::string(sv); }
+    std::string_view asStringView() const {
+        const uint8_t* p=nullptr; size_t n=0; str_info(view_, p, n);
+        return std::string_view(reinterpret_cast<const char*>(p), n);
+    }
+
+    std::span<const std::byte> asBlob() const {
+        const uint8_t* p=nullptr; size_t n=0; bin_info(view_, p, n);
+        return { reinterpret_cast<const std::byte*>(p), n };
+    }
+
+    // ---- map interface ----
+
+    struct KeysView {
+        // store the map payload view and precomputed count/offset
+        std::span<const uint8_t> v{};
+        size_t count = 0;
+        size_t payload_off = 0;
+
+        struct iterator {
+            // default-constructible → forward iterator
+            std::span<const uint8_t> v{};
+            size_t i = 0;
+            size_t off = 0; // byte offset at current key
+
+            using iterator_category = std::forward_iterator_tag;
+            using iterator_concept  = std::forward_iterator_tag;
+            using value_type        = std::string_view;
+            using difference_type   = std::ptrdiff_t;
+            using reference         = std::string_view;
+
+            iterator() = default;
+            iterator(std::span<const uint8_t> vv, size_t idx, size_t start_off)
+                : v(vv), i(idx), off(start_off) {}
+
+            reference operator*() const {
+                // key at off
+                auto key_span = v.subspan(off);
+                size_t key_sz = mp_skip(key_span);
+                MsgPackDeserializer kd(key_span.first(key_sz), true);
+                // keys must be strings in our concept
+                return kd.asStringView();
+            }
+            iterator& operator++() {
+                // advance past key and value
+                auto key_span = v.subspan(off);
+                size_t key_sz = mp_skip(key_span);
+                size_t val_sz = mp_skip(v.subspan(off + key_sz));
+                off += key_sz + val_sz;
+                ++i;
+                return *this;
+            }
+            iterator operator++(int){ auto tmp=*this; ++(*this); return tmp; }
+
+            friend bool operator==(const iterator& a, const iterator& b) {
+                return a.v.data()==b.v.data() && a.i==b.i && a.off==b.off;
+            }
+        };
+
+        iterator begin() const { return iterator{ v, 0, payload_off }; }
+        iterator end()   const {
+            // compute byte offset of end by walking all entries
+            size_t off = payload_off;
+            for (size_t i=0;i<count;++i) {
+                size_t ks = mp_skip(v.subspan(off));
+                off += ks;
+                size_t vs = mp_skip(v.subspan(off));
+                off += vs;
+            }
+            return iterator{ v, count, off };
+        }
+    };
+
+    KeysView mapKeys() const {
+        if (!isMap()) throw DeserializationError("not map");
+        size_t n=0, off=0; map_info(view_, n, off);
+        return KeysView{ view_, n, off };
+    }
+
+    // Like KeysView, but each dereference also hands back the value at that
+    // same position -- avoids the O(n) re-scan-from-start that operator[]
+    // does when a caller wants (key, value) for every entry (walking the
+    // whole map via mapKeys()+operator[] is O(n^2); this is O(n)). Defined
+    // out-of-line below: Entry holds a MsgPackDeserializer by value, which
+    // needs the class to be complete first.
+    struct EntriesView;
+    EntriesView mapEntries() const;
+
+    bool contains(std::string_view key) const {
+        if (!isMap()) return false;
+        size_t n=0, off=0; map_info(view_, n, off);
+        for (size_t i=0;i<n;++i) {
+            auto kspan = view_.subspan(off);
+            size_t ksz = mp_skip(kspan);
+            MsgPackDeserializer kd(kspan.first(ksz), true);
+            off += ksz;
+            auto vspan = view_.subspan(off);
+            size_t vsz = mp_skip(vspan);
+            if (kd.isString() && kd.asStringView() == key) {
+                return true;
+            }
+            off += vsz;
+        }
+        return false;
+    }
+
+    MsgPackDeserializer operator[](std::string_view key) const {
+        if (!isMap()) throw DeserializationError("not map");
+        size_t n=0, off=0; map_info(view_, n, off);
+        for (size_t i=0;i<n;++i) {
+            auto kspan = view_.subspan(off);
+            size_t ksz = mp_skip(kspan);
+            MsgPackDeserializer kd(kspan.first(ksz), true);
+            off += ksz;
+            auto vspan = view_.subspan(off);
+            size_t vsz = mp_skip(vspan);
+            if (kd.isString() && kd.asStringView() == key) {
+                return MsgPackDeserializer(vspan.first(vsz), true);
+            }
+            off += vsz;
+        }
+        throw DeserializationError("key not found: " + std::string(key));
+    }
+
+    // ---- array interface ----
+    size_t arraySize() const {
+        size_t n=0, off=0; arr_info(view_, n, off); (void)off; return n;
+    }
+
+    MsgPackDeserializer operator[](size_t idx) const {
+        size_t n=0, off=0; arr_info(view_, n, off);
+        if (idx >= n) throw DeserializationError("index OOB");
+        for (size_t i=0;i<idx;++i) off += mp_skip(view_.subspan(off));
+        size_t sz = mp_skip(view_.subspan(off));
+        return MsgPackDeserializer(view_.subspan(off, sz), true);
+    }
+
+    // Sequential single-pass array walk -- avoids the O(n) re-scan-from-
+    // start that operator[](idx) does when a caller wants every element
+    // (walking the whole array via arraySize()+operator[] is O(n^2); this
+    // is O(n)). Defined out-of-line below: iterator::operator*() returns a
+    // MsgPackDeserializer by value, which needs the class to be complete
+    // first.
+    struct ElementsView;
+    ElementsView elements() const;
+
+    // ---- debug ----
+    std::string to_string() const {
+        std::ostringstream os; dump(os, *this, 0); return os.str();
+    }
+
+    // expose raw view if you need it
+    std::span<const uint8_t> raw_view() const { return view_; }
+};
+
+struct MsgPackDeserializer::EntriesView {
+    std::span<const uint8_t> v{};
+    size_t count = 0;
+    size_t payload_off = 0;
+
+    struct Entry { std::string_view key; MsgPackDeserializer value; };
+
+    struct iterator {
+        std::span<const uint8_t> v{};
+        size_t i = 0;
+        size_t off = 0;
+
+        using iterator_category = std::forward_iterator_tag;
+        using iterator_concept  = std::forward_iterator_tag;
+        using value_type        = Entry;
+        using difference_type   = std::ptrdiff_t;
+        using reference         = Entry;
+
+        iterator() = default;
+        iterator(std::span<const uint8_t> vv, size_t idx, size_t start_off)
+            : v(vv), i(idx), off(start_off) {}
+
+        reference operator*() const {
+            auto key_span = v.subspan(off);
+            size_t key_sz = mp_skip(key_span);
+            MsgPackDeserializer kd(key_span.first(key_sz), true);
+            auto val_span = v.subspan(off + key_sz);
+            size_t val_sz = mp_skip(val_span);
+            return Entry{ kd.asStringView(), MsgPackDeserializer(val_span.first(val_sz), true) };
+        }
+        iterator& operator++() {
+            auto key_span = v.subspan(off);
+            size_t key_sz = mp_skip(key_span);
+            size_t val_sz = mp_skip(v.subspan(off + key_sz));
+            off += key_sz + val_sz;
+            ++i;
+            return *this;
+        }
+        iterator operator++(int){ auto tmp=*this; ++(*this); return tmp; }
+
+        friend bool operator==(const iterator& a, const iterator& b) {
+            return a.v.data()==b.v.data() && a.i==b.i && a.off==b.off;
+        }
+    };
+
+    iterator begin() const { return iterator{ v, 0, payload_off }; }
+    iterator end()   const {
+        size_t off = payload_off;
+        for (size_t i=0;i<count;++i) {
+            size_t ks = mp_skip(v.subspan(off));
+            off += ks;
+            size_t vs = mp_skip(v.subspan(off));
+            off += vs;
+        }
+        return iterator{ v, count, off };
+    }
+};
+
+inline MsgPackDeserializer::EntriesView MsgPackDeserializer::mapEntries() const {
+    if (!isMap()) throw DeserializationError("not map");
+    size_t n=0, off=0; map_info(view_, n, off);
+    return EntriesView{ view_, n, off };
+}
+
+struct MsgPackDeserializer::ElementsView {
+    std::span<const uint8_t> v{};
+    size_t count = 0;
+    size_t payload_off = 0;
+
+    struct iterator {
+        std::span<const uint8_t> v{};
+        size_t i = 0;
+        size_t off = 0;
+
+        using iterator_category = std::forward_iterator_tag;
+        using iterator_concept  = std::forward_iterator_tag;
+        using value_type        = MsgPackDeserializer;
+        using difference_type   = std::ptrdiff_t;
+        using reference         = MsgPackDeserializer;
+
+        iterator() = default;
+        iterator(std::span<const uint8_t> vv, size_t idx, size_t start_off)
+            : v(vv), i(idx), off(start_off) {}
+
+        reference operator*() const {
+            size_t sz = mp_skip(v.subspan(off));
+            return MsgPackDeserializer(v.subspan(off, sz), true);
+        }
+        iterator& operator++() {
+            off += mp_skip(v.subspan(off));
+            ++i;
+            return *this;
+        }
+        iterator operator++(int){ auto tmp=*this; ++(*this); return tmp; }
+
+        friend bool operator==(const iterator& a, const iterator& b) {
+            return a.v.data()==b.v.data() && a.i==b.i && a.off==b.off;
+        }
+    };
+
+    iterator begin() const { return iterator{ v, 0, payload_off }; }
+    iterator end()   const {
+        size_t off = payload_off;
+        for (size_t i=0;i<count;++i) off += mp_skip(v.subspan(off));
+        return iterator{ v, count, off };
+    }
+};
+
+inline MsgPackDeserializer::ElementsView MsgPackDeserializer::elements() const {
+    size_t n=0, off=0; arr_info(view_, n, off);
+    return ElementsView{ view_, n, off };
+}
+
+// ===== Writer (msgpack-c) =====================================================
+class MsgPackRootSerializer {
+    [[gnu::noinline]] void grow_raw_append(std::size_t max_len) {
+        std::size_t needed = sbuf.size + max_len;
+        std::size_t new_alloc = (sbuf.alloc > 0) ? sbuf.alloc : 256;
+        while (new_alloc < needed) {
+            new_alloc *= 2;
+        }
+        char* new_data = static_cast<char*>(std::realloc(sbuf.data, new_alloc));
+        if (new_data == nullptr) {
+            throw SerializationError("msgpack: failed to grow output buffer");
+        }
+        sbuf.data = new_data;
+        sbuf.alloc = new_alloc;
+    }
+
+public:
+    msgpack_sbuffer sbuf{};
+
+    MsgPackRootSerializer() {
+        msgpack_sbuffer_init(&sbuf);
+    }
+    ~MsgPackRootSerializer() { msgpack_sbuffer_destroy(&sbuf); }
+
+    ZBuffer finish() {
+        if (sbuf.size == 0) return ZBuffer();
+        // steal buffer
+        size_t n = sbuf.size;
+        char*  d = sbuf.data;
+        sbuf.data = nullptr; sbuf.size = 0; sbuf.alloc = 0;
+        return ZBuffer(d, n, ZBuffer::Deleters::Free);
+    }
+
+    [[gnu::always_inline]] uint8_t* reserve_raw_append(std::size_t max_len) {
+        if (max_len > sbuf.alloc - sbuf.size) [[unlikely]] {
+            grow_raw_append(max_len);
+        }
+        return reinterpret_cast<uint8_t*>(sbuf.data + sbuf.size);
+    }
+
+    void commit_raw_append(std::size_t len) { sbuf.size += len; }
+
+    void write_raw(const uint8_t* data, std::size_t len) {
+        if (len == 0) return;
+        uint8_t* out = reserve_raw_append(len);
+        switch (len) {
+            case 1: std::memcpy(out, data, 1); break;
+            case 2: std::memcpy(out, data, 2); break;
+            case 3: std::memcpy(out, data, 3); break;
+            case 4: std::memcpy(out, data, 4); break;
+            case 5: std::memcpy(out, data, 5); break;
+            case 6: std::memcpy(out, data, 6); break;
+            case 7: std::memcpy(out, data, 7); break;
+            case 8: std::memcpy(out, data, 8); break;
+            default: std::memcpy(out, data, len); break;
+        }
+        commit_raw_append(len);
+    }
+
+    void write_raw(std::span<const uint8_t> bytes) {
+        write_raw(bytes.data(), bytes.size());
+    }
+};
+
+class MsgPackSerializer {
+    MsgPackRootSerializer* rs_;
+
+    static void store_be16(uint8_t* out, uint16_t value) {
+        out[0] = static_cast<uint8_t>(value >> 8);
+        out[1] = static_cast<uint8_t>(value);
+    }
+
+    static void store_be32(uint8_t* out, uint32_t value) {
+        out[0] = static_cast<uint8_t>(value >> 24);
+        out[1] = static_cast<uint8_t>(value >> 16);
+        out[2] = static_cast<uint8_t>(value >> 8);
+        out[3] = static_cast<uint8_t>(value);
+    }
+
+    static void store_be64(uint8_t* out, uint64_t value) {
+        store_be32(out, static_cast<uint32_t>(value >> 32));
+        store_be32(out + 4, static_cast<uint32_t>(value));
+    }
+
+    static uint8_t* encode_uint64(uint8_t* out, uint64_t value) {
+        if (value <= UINT8_C(0x7f)) {
+            *out++ = static_cast<uint8_t>(value);
+        } else if (value <= UINT8_MAX) {
+            *out++ = 0xcc;
+            *out++ = static_cast<uint8_t>(value);
+        } else if (value <= UINT16_MAX) {
+            *out++ = 0xcd;
+            store_be16(out, static_cast<uint16_t>(value));
+            out += 2;
+        } else if (value <= UINT32_MAX) {
+            *out++ = 0xce;
+            store_be32(out, static_cast<uint32_t>(value));
+            out += 4;
+        } else {
+            *out++ = 0xcf;
+            store_be64(out, value);
+            out += 8;
+        }
+        return out;
+    }
+
+    uint8_t* begin_scalar() { return rs_->reserve_raw_append(9); }
+    void end_scalar(uint8_t* begin, uint8_t* out) {
+        rs_->commit_raw_append(static_cast<std::size_t>(out - begin));
+    }
+
+public:
+    explicit MsgPackSerializer(MsgPackRootSerializer& rs) : rs_(&rs) {}
+
+    // primitives
+    void null() {
+        uint8_t* out = rs_->reserve_raw_append(1);
+        *out = 0xc0;
+        rs_->commit_raw_append(1);
+    }
+    void boolean(bool v) {
+        uint8_t* out = rs_->reserve_raw_append(1);
+        *out = v ? 0xc3 : 0xc2;
+        rs_->commit_raw_append(1);
+    }
+    void int64(std::int64_t v) {
+        uint8_t* begin = begin_scalar();
+        uint8_t* out = begin;
+        if (v >= 0) {
+            out = encode_uint64(out, static_cast<uint64_t>(v));
+        } else if (v >= -32) {
+            *out++ = static_cast<uint8_t>(v);
+        } else if (v >= INT8_MIN) {
+            *out++ = 0xd0;
+            *out++ = static_cast<uint8_t>(v);
+        } else if (v >= INT16_MIN) {
+            *out++ = 0xd1;
+            store_be16(out, static_cast<uint16_t>(v));
+            out += 2;
+        } else if (v >= INT32_MIN) {
+            *out++ = 0xd2;
+            store_be32(out, static_cast<uint32_t>(v));
+            out += 4;
+        } else {
+            *out++ = 0xd3;
+            store_be64(out, static_cast<uint64_t>(v));
+            out += 8;
+        }
+        end_scalar(begin, out);
+    }
+    void uint64(std::uint64_t v) {
+        uint8_t* begin = begin_scalar();
+        end_scalar(begin, encode_uint64(begin, v));
+    }
+    void double_(double v) {
+        uint8_t* begin = begin_scalar();
+        begin[0] = 0xcb;
+        store_be64(begin + 1, std::bit_cast<uint64_t>(v));
+        rs_->commit_raw_append(9);
+    }
+    void string(std::string_view sv) {
+        std::size_t len = sv.size();
+        uint8_t* begin = rs_->reserve_raw_append(len + 5);
+        uint8_t* out = begin;
+        if (len < 32) {
+            *out++ = static_cast<uint8_t>(0xa0 | len);
+        } else if (len < 256) {
+            *out++ = 0xd9;
+            *out++ = static_cast<uint8_t>(len);
+        } else if (len < 65536) {
+            *out++ = 0xda;
+            store_be16(out, static_cast<uint16_t>(len));
+            out += 2;
+        } else {
+            *out++ = 0xdb;
+            store_be32(out, static_cast<uint32_t>(len));
+            out += 4;
+        }
+        if (len > 0) {
+            std::memcpy(out, sv.data(), len);
+            out += len;
+        }
+        rs_->commit_raw_append(static_cast<std::size_t>(out - begin));
+    }
+    void binary(std::span<const std::byte> b) {
+        std::size_t len = b.size();
+        uint8_t* begin = rs_->reserve_raw_append(len + 5);
+        uint8_t* out = begin;
+        if (len < 256) {
+            *out++ = 0xc4;
+            *out++ = static_cast<uint8_t>(len);
+        } else if (len < 65536) {
+            *out++ = 0xc5;
+            store_be16(out, static_cast<uint16_t>(len));
+            out += 2;
+        } else {
+            *out++ = 0xc6;
+            store_be32(out, static_cast<uint32_t>(len));
+            out += 4;
+        }
+        if (len > 0) {
+            std::memcpy(out, b.data(), len);
+            out += len;
+        }
+        rs_->commit_raw_append(static_cast<std::size_t>(out - begin));
+    }
+
+    // arrays/maps (MsgPack needs sizes up-front)
+    void begin_array(std::size_t n) {
+        uint8_t* begin = rs_->reserve_raw_append(5);
+        uint8_t* out = begin;
+        if (n < 16) {
+            *out++ = static_cast<uint8_t>(0x90 | n);
+        } else if (n < 65536) {
+            *out++ = 0xdc;
+            store_be16(out, static_cast<uint16_t>(n));
+            out += 2;
+        } else {
+            *out++ = 0xdd;
+            store_be32(out, static_cast<uint32_t>(n));
+            out += 4;
+        }
+        rs_->commit_raw_append(static_cast<std::size_t>(out - begin));
+    }
+    void end_array()                { /* no-op */ }
+
+    void begin_map(std::size_t n) {
+        uint8_t* begin = rs_->reserve_raw_append(5);
+        uint8_t* out = begin;
+        if (n < 16) {
+            *out++ = static_cast<uint8_t>(0x80 | n);
+        } else if (n < 65536) {
+            *out++ = 0xde;
+            store_be16(out, static_cast<uint16_t>(n));
+            out += 2;
+        } else {
+            *out++ = 0xdf;
+            store_be32(out, static_cast<uint32_t>(n));
+            out += 4;
+        }
+        rs_->commit_raw_append(static_cast<std::size_t>(out - begin));
+    }
+    void end_map()                  { /* no-op */ }
+    void begin_map_preencoded(std::span<const uint8_t> encoded_header) { rs_->write_raw(encoded_header); }
+    void begin_map_preencoded(const uint8_t* data, std::size_t len) { rs_->write_raw(data, len); }
+
+    void key(std::string_view k)    { string(k); }
+    void key_preencoded(std::span<const uint8_t> encoded_key) { rs_->write_raw(encoded_key); }
+    void key_preencoded(const uint8_t* data, std::size_t len) { rs_->write_raw(data, len); }
+    uint8_t* reserve_raw_append(std::size_t max_len) { return rs_->reserve_raw_append(max_len); }
+    void commit_raw_append(std::size_t len) { rs_->commit_raw_append(len); }
+};
+
+struct MsgPack {
+    static inline constexpr const char* Name = "MsgPack";
+    using Deserializer   = MsgPackDeserializer; 
+    using RootSerializer = MsgPackRootSerializer;
+    using Serializer     = MsgPackSerializer;
+};
+
+} // namespace zerialize

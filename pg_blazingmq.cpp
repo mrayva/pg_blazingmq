@@ -1,27 +1,222 @@
 /*
  * pg_blazingmq.cpp
- * Phase 1: proof-of-linkage only. pg_blazingmq_link_check() constructs a
- * real bmqa::Session (via bmqt::SessionOptions) without calling start(), so
- * it exercises the full BDE/NTF/bmq symbol chain without requiring a live
- * broker. No publish/consume functionality yet.
+ *
+ * Phase 1: pg_blazingmq_link_check() - proof-of-linkage only, see README.
+ *
+ * Phase 2: bmq_publish_row(queue_uri, row, attr_columns) - publishes a
+ * Postgres row to a BlazingMQ queue. Chosen columns (or, if attr_columns is
+ * NULL, every bool/int2/int4/int8/text-family column) are promoted to
+ * typed bmqa::MessageProperties for server-side subscriber filtering via
+ * BlazingMQ's own bmqeval expression language; the full row is packed as
+ * the message payload via zerialize (msgpack).
  */
 
 extern "C" {
 #include "postgres.h"
 #include "fmgr.h"
+#include "funcapi.h"
 #include "utils/builtins.h"
+#include "utils/array.h"
+#include "utils/guc.h"
+#include "utils/lsyscache.h"
+#include "access/htup_details.h"
+#include "access/tupdesc.h"
+#include "storage/ipc.h"
 #include "varatt.h"
 
 #ifdef PG_MODULE_MAGIC
 PG_MODULE_MAGIC;
 #endif
+
+void _PG_init(void);
 }
 
 #include <bmqa_session.h>
+#include <bmqa_queueid.h>
+#include <bmqa_openqueuestatus.h>
+#include <bmqa_messageeventbuilder.h>
+#include <bmqa_message.h>
+#include <bmqa_messageproperties.h>
 #include <bmqt_sessionoptions.h>
+#include <bmqt_uri.h>
+#include <bmqt_queueflags.h>
+#include <bsls_timeinterval.h>
+
+#include <zerialize/zerialize.hpp>
+#include <zerialize/dynamic.hpp>
+#include <zerialize/protocols/msgpack.hpp>
 
 #include <sstream>
 #include <string>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+#include <stdexcept>
+
+namespace z = zerialize;
+namespace bmqa = BloombergLP::bmqa;
+namespace bmqt = BloombergLP::bmqt;
+namespace bsls = BloombergLP::bsls;
+
+// --- GUC -------------------------------------------------------------------
+
+static char* g_broker_uri = nullptr;
+
+void _PG_init(void)
+{
+    DefineCustomStringVariable(
+        "blazingmq.broker_uri",
+        "BlazingMQ broker URI used by pg_blazingmq functions.",
+        NULL,
+        &g_broker_uri,
+        "tcp://localhost:30114",
+        PGC_USERSET,
+        0,
+        NULL, NULL, NULL);
+}
+
+// --- Session / queue-handle lifecycle --------------------------------------
+//
+// One Session per backend process, lazily started on first use and torn
+// down via on_proc_exit. QueueId handles are cached per URI for the life of
+// the backend - BlazingMQ owns queue existence/state server-side, so this
+// is purely a local handle cache, not something that needs rebuilding.
+
+static bmqa::Session* g_session = nullptr;
+static std::unordered_map<std::string, bmqa::QueueId>* g_write_queues = nullptr;
+static bool g_exit_hook_registered = false;
+
+static void pg_blazingmq_exit_hook(int /*code*/, Datum /*arg*/)
+{
+    if (g_write_queues) {
+        delete g_write_queues;
+        g_write_queues = nullptr;
+    }
+    if (g_session) {
+        g_session->stop();
+        delete g_session;
+        g_session = nullptr;
+    }
+}
+
+static bmqa::Session& get_session()
+{
+    if (g_session) return *g_session;
+
+    bmqt::SessionOptions options;
+    options.setBrokerUri(g_broker_uri);
+
+    auto session = std::make_unique<bmqa::Session>(options);
+    int rc = session->start(bsls::TimeInterval(10));
+    if (rc != 0) {
+        throw std::runtime_error(
+            "failed to start BlazingMQ session against '" +
+            std::string(g_broker_uri) + "' (rc=" + std::to_string(rc) + ")");
+    }
+
+    g_session = session.release();
+    if (!g_exit_hook_registered) {
+        on_proc_exit(pg_blazingmq_exit_hook, 0);
+        g_exit_hook_registered = true;
+    }
+    return *g_session;
+}
+
+static bmqa::QueueId& get_write_queue(bmqa::Session& session, const std::string& uri)
+{
+    if (!g_write_queues) {
+        g_write_queues = new std::unordered_map<std::string, bmqa::QueueId>();
+    }
+
+    auto it = g_write_queues->find(uri);
+    if (it != g_write_queues->end()) return it->second;
+
+    bmqa::QueueId queueId;
+    bmqa::OpenQueueStatus status = session.openQueueSync(
+        &queueId, bmqt::Uri(uri.c_str()), bmqt::QueueFlags::e_WRITE);
+    if (status.result() != bmqt::OpenQueueResult::e_SUCCESS) {
+        std::ostringstream err;
+        err << "failed to open BlazingMQ queue '" << uri << "' for writing: " << status;
+        throw std::runtime_error(err.str());
+    }
+
+    auto [inserted_it, inserted] = g_write_queues->emplace(uri, queueId);
+    (void)inserted;
+    return inserted_it->second;
+}
+
+// --- Row -> {payload, properties} ------------------------------------------
+
+// Attribute (MessageProperty) mapping is intentionally strict: only types
+// BlazingMQ's own property/expression system can actually filter on. See
+// README's Expression Syntax notes - no float/double, no lists.
+static bool set_message_property(
+    bmqa::MessageProperties& props, const std::string& name,
+    Oid typid, Datum value, bool isnull)
+{
+    if (isnull) return false; // BlazingMQ properties have no null variant; omit.
+
+    switch (typid) {
+        case BOOLOID:
+            props.setPropertyAsBool(name, DatumGetBool(value));
+            return true;
+        case INT2OID:
+            props.setPropertyAsShort(name, DatumGetInt16(value));
+            return true;
+        case INT4OID:
+            props.setPropertyAsInt32(name, DatumGetInt32(value));
+            return true;
+        case INT8OID:
+            props.setPropertyAsInt64(name, DatumGetInt64(value));
+            return true;
+        case TEXTOID:
+        case VARCHAROID:
+        case BPCHAROID: {
+            text* t = DatumGetTextPP(value);
+            props.setPropertyAsString(
+                name, std::string_view(VARDATA_ANY(t), VARSIZE_ANY_EXHDR(t)));
+            return true;
+        }
+        default:
+            return false; // caller decides whether "ineligible" is an error
+    }
+}
+
+// Payload mapping is permissive - the full row, not just filterable
+// columns, goes into the message body. Anything without a direct zerialize
+// mapping falls back to the column's own text output function.
+static z::dyn::Value datum_to_dyn_value(Oid typid, Oid typoutput, Datum value, bool isnull)
+{
+    if (isnull) return z::dyn::Value(z::dyn::Null{});
+
+    switch (typid) {
+        case BOOLOID:
+            return z::dyn::Value(DatumGetBool(value));
+        case INT2OID:
+            return z::dyn::Value(static_cast<int64_t>(DatumGetInt16(value)));
+        case INT4OID:
+            return z::dyn::Value(static_cast<int64_t>(DatumGetInt32(value)));
+        case INT8OID:
+            return z::dyn::Value(static_cast<int64_t>(DatumGetInt64(value)));
+        case FLOAT4OID:
+            return z::dyn::Value(static_cast<double>(DatumGetFloat4(value)));
+        case FLOAT8OID:
+            return z::dyn::Value(DatumGetFloat8(value));
+        case TEXTOID:
+        case VARCHAROID:
+        case BPCHAROID: {
+            text* t = DatumGetTextPP(value);
+            return z::dyn::Value(std::string_view(VARDATA_ANY(t), VARSIZE_ANY_EXHDR(t)));
+        }
+        default: {
+            char* out = OidOutputFunctionCall(typoutput, value);
+            z::dyn::Value v{std::string(out)};
+            pfree(out);
+            return v;
+        }
+    }
+}
 
 extern "C" {
 
@@ -32,19 +227,142 @@ Datum pg_blazingmq_link_check(PG_FUNCTION_ARGS)
     text* broker_uri_text = PG_GETARG_TEXT_PP(0);
     std::string broker_uri(VARDATA_ANY(broker_uri_text), VARSIZE_ANY_EXHDR(broker_uri_text));
 
-    BloombergLP::bmqt::SessionOptions options;
+    bmqt::SessionOptions options;
     options.setBrokerUri(broker_uri);
 
     // Constructing (not starting) a real Session exercises the full
     // bmqa/bmqimp/bmqp/.../BDE/NTF symbol chain without connecting to
     // anything.
-    BloombergLP::bmqa::Session session(options);
+    bmqa::Session session(options);
 
     std::ostringstream out;
     out << "pg_blazingmq link OK: brokerUri=" << options.brokerUri()
         << " numProcessingThreads=" << options.numProcessingThreads();
 
     PG_RETURN_TEXT_P(cstring_to_text(out.str().c_str()));
+}
+
+PG_FUNCTION_INFO_V1(bmq_publish_row);
+
+Datum bmq_publish_row(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0)) ereport(ERROR, (errmsg("queue_uri must not be null")));
+    if (PG_ARGISNULL(1)) ereport(ERROR, (errmsg("row must not be null")));
+
+    text* queue_uri_text = PG_GETARG_TEXT_PP(0);
+    std::string queue_uri(VARDATA_ANY(queue_uri_text), VARSIZE_ANY_EXHDR(queue_uri_text));
+
+    HeapTupleHeader rec = PG_GETARG_HEAPTUPLEHEADER(1);
+
+    // Explicit attribute list, if given; NULL means "every eligible column".
+    std::unordered_set<std::string> requested_attrs;
+    bool attrs_explicit = !PG_ARGISNULL(2);
+    if (attrs_explicit) {
+        ArrayType* arr = PG_GETARG_ARRAYTYPE_P(2);
+        Datum* elems;
+        bool* nulls;
+        int nelems;
+        deconstruct_array(arr, TEXTOID, -1, false, TYPALIGN_INT, &elems, &nulls, &nelems);
+        for (int i = 0; i < nelems; ++i) {
+            if (nulls[i]) continue;
+            text* t = DatumGetTextPP(elems[i]);
+            requested_attrs.emplace(VARDATA_ANY(t), VARSIZE_ANY_EXHDR(t));
+        }
+    }
+
+    Oid tupType = HeapTupleHeaderGetTypeId(rec);
+    int32 tupTypmod = HeapTupleHeaderGetTypMod(rec);
+    TupleDesc tupdesc = lookup_rowtype_tupdesc(tupType, tupTypmod);
+
+    HeapTupleData tmptup;
+    tmptup.t_len = HeapTupleHeaderGetDatumLength(rec);
+    ItemPointerSetInvalid(&tmptup.t_self);
+    tmptup.t_tableOid = InvalidOid;
+    tmptup.t_data = rec;
+
+    int natts = tupdesc->natts;
+    std::vector<Datum> values(natts);
+    std::vector<uint8_t> isnulls_storage(natts);
+    bool* isnulls = reinterpret_cast<bool*>(isnulls_storage.data());
+    heap_deform_tuple(&tmptup, tupdesc, values.data(), isnulls);
+
+    try {
+        bmqa::MessageProperties props;
+        z::dyn::Value::Map row_map;
+        row_map.reserve(natts);
+
+        for (int i = 0; i < natts; ++i) {
+            Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+            if (attr->attisdropped) continue;
+
+            std::string colname(NameStr(attr->attname));
+            Datum value = values[i];
+            bool isnull = isnulls[i];
+
+            bool want_attr = attrs_explicit
+                ? requested_attrs.contains(colname)
+                : true;
+
+            if (want_attr) {
+                bool eligible = set_message_property(props, colname, attr->atttypid, value, isnull);
+                if (!eligible && attrs_explicit) {
+                    ReleaseTupleDesc(tupdesc);
+                    ereport(ERROR,
+                            (errmsg("column \"%s\" (type %u) cannot be a BlazingMQ message "
+                                    "attribute - only bool/int2/int4/int8/text-family columns "
+                                    "are supported (see README's Expression Syntax notes)",
+                                    colname.c_str(), attr->atttypid)));
+                }
+            }
+
+            Oid typoutput; bool typisvarlena;
+            getTypeOutputInfo(attr->atttypid, &typoutput, &typisvarlena);
+            row_map.emplace_back(colname, datum_to_dyn_value(attr->atttypid, typoutput, value, isnull));
+        }
+
+        z::ZBuffer payload = z::serialize<z::MsgPack>(z::dyn::Value::map(std::move(row_map)));
+
+        bmqa::Session& session = get_session();
+        bmqa::QueueId& queueId = get_write_queue(session, queue_uri);
+
+        bmqa::MessageEventBuilder builder;
+        session.loadMessageEventBuilder(&builder);
+
+        bmqa::Message& msg = builder.startMessage();
+        msg.setDataRef(reinterpret_cast<const char*>(payload.data()),
+                        static_cast<size_t>(payload.size()));
+        if (props.numProperties() > 0) {
+            msg.setPropertiesRef(&props);
+        }
+
+        bmqt::EventBuilderResult::Enum pack_rc = builder.packMessage(queueId);
+        if (pack_rc != bmqt::EventBuilderResult::e_SUCCESS) {
+            ReleaseTupleDesc(tupdesc);
+            ereport(ERROR, (errmsg("failed to pack BlazingMQ message for queue '%s' (rc=%d)",
+                                    queue_uri.c_str(), static_cast<int>(pack_rc))));
+        }
+
+        int post_rc = session.post(builder.messageEvent());
+        if (post_rc != 0) {
+            ReleaseTupleDesc(tupdesc);
+            ereport(ERROR, (errmsg("failed to post BlazingMQ message to queue '%s' (rc=%d)",
+                                    queue_uri.c_str(), post_rc)));
+        }
+    } catch (const std::exception& ex) {
+        ReleaseTupleDesc(tupdesc);
+        ereport(ERROR,
+                (errcode(ERRCODE_CONNECTION_EXCEPTION),
+                 errmsg("bmq_publish_row failed"),
+                 errdetail("%s", ex.what())));
+    } catch (...) {
+        ReleaseTupleDesc(tupdesc);
+        ereport(ERROR,
+                (errcode(ERRCODE_CONNECTION_EXCEPTION),
+                 errmsg("bmq_publish_row failed with unknown exception")));
+    }
+
+    ReleaseTupleDesc(tupdesc);
+    PG_RETURN_VOID();
 }
 
 } // extern "C"

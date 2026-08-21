@@ -8,7 +8,7 @@ MODULE_big = pg_blazingmq
 OBJS = pg_blazingmq.o
 
 EXTENSION = pg_blazingmq
-DATA = pg_blazingmq--0.1.sql
+DATA = pg_blazingmq--0.1.sql pg_blazingmq--0.2.sql pg_blazingmq--0.1--0.2.sql
 
 # Root of a BlazingMQ checkout already built via bin/build-ubuntu.sh (BDE/NTF
 # installed under $(BMQ_ROOT)/include and $(BMQ_ROOT)/lib64; bmq group built
@@ -27,7 +27,8 @@ BMQ_PKGS = bmqa bmqc bmqeval bmqex bmqimp bmqio bmqma bmqp bmqpi bmqscm \
 
 PG_CPPFLAGS = -std=c++23 -fPIC \
     -isystem $(BMQ_ROOT)/include \
-    $(foreach pkg,$(BMQ_PKGS),-I$(BMQ_SRC)/$(pkg))
+    $(foreach pkg,$(BMQ_PKGS),-I$(BMQ_SRC)/$(pkg)) \
+    -Ivendor/zerialize/include
 
 # -Wl,--start-group/--end-group sidesteps static-lib link-order pain across
 # this many mutually-referencing archives - confirmed working against the
