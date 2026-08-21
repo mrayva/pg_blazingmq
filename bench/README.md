@@ -1236,3 +1236,63 @@ an empirically grounded difference, not an assumed one.
 
 Teardown clean: `nats-server` stopped after each configuration, no
 leftover `nats_selectivity.py` processes.
+
+## NATS Core Queue-Group Scaling: Real, But Bounded, Not Unlimited
+
+A blog post claimed, with zero supporting evidence, that NATS "queue
+groups distribute messages across subscribers, enabling horizontal
+scaling." Queue groups are NATS core's own round-robin distribution
+mechanism - structurally the direct analog of BlazingMQ's priority mode,
+which was rigorously tested above and found *not* to scale: every
+consumer count from 1 to 32 hit the same ~42-48k/s wall, with 2 and 4
+consumers actively *collapsing* under live-publish contention (to ~3,999/s
+and ~32,000/s respectively) rather than scaling. This section tests
+whether NATS core's version of the same idea holds up any better.
+
+Script: `bench/nats_queue_group.py` (+ a throwaway orchestrator, not
+committed). One publisher process, N competing consumer processes (N = 1,
+2, 4, 8) all subscribed to one subject under the same queue-group name -
+every process is a separate OS process, avoiding the exact
+same-event-loop confound the selectivity test above already found and
+fixed (a subscriber's own inbound-message load leaking into publish-side
+timing). Fresh `nats-server` restart before each N. 100,000 messages per
+run, each carrying a sequence id so correctness can be checked directly:
+every run showed 0 duplicates and 0 missing (the full `{0..99999}` id set
+received exactly once, split across the group), and round-robin
+distribution was genuinely balanced, not skewed to one consumer - e.g. at
+N=8, each consumer received 12,386-12,672 of an expected ~12,500 share.
+
+| N | publish rate | aggregate consume rate | per-consumer share |
+|---|---|---|---|
+| 1 | 751,872/s | 404,611/s | [100000] |
+| 2 | 748,715/s | 764,878/s | [50001, 49999] |
+| 4 | 788,105/s | 915,954/s | [24775, 25226, 25191, 24808] |
+| 8 | 651,551/s | 772,467/s | [12413, 12672, 12544, 12474, 12644, 12386, 12396, 12471] |
+
+**Finding: NATS core queue groups deliver real scaling gains that
+BlazingMQ's priority mode never showed - but the gains are bounded, not
+unlimited, and the blog post's unqualified claim is only half right.**
+Aggregate consume rate genuinely scales from N=1 to N=4 (404,611/s -&gt;
+915,954/s, ~2.3x), with the largest single jump between N=1 and N=2
+(~1.9x) - a real, structural difference from BlazingMQ's priority mode,
+which never produced a scaling gain at *any* consumer count. But it isn't
+unlimited: N=8 regresses on both axes relative to N=4 - aggregate consume
+rate drops to 772,467/s and publish rate drops too (651,551/s vs
+~750-790k/s at N=1/2/4) - so somewhere between N=4 and N=8, something
+starts limiting throughput here as well, just at a far higher absolute
+rate and with a much gentler degradation than BlazingMQ's outright
+collapse (not root-caused further - out of scope here, a natural
+follow-up would be `perf` on `nats-server` at N=8 the same way `bmqbrkr`
+was profiled elsewhere in this document).
+
+Practical takeaway: "queue groups enable horizontal scaling" is
+directionally true up to a point on this hardware, not the unconditional
+scaling promise the source article implied - a reader provisioning
+consumers expecting monotonic gains past N=4 would be wrong, on this
+config. Same caveat as the selectivity test above: single sample per N
+(not repeated/averaged), `nats-py` client (absolute rates aren't
+comparable to `nats_tool`'s C++ numbers elsewhere in this document - only
+the shape across N is the claim).
+
+Teardown clean: `nats-server` and every consumer/publisher process
+terminated after each configuration.
