@@ -925,3 +925,62 @@ changes made and reverted the same way as every other run in this
 document; `git status --short` in `~/blazingmq` confirmed clean, broker
 stopped, no leftover `pg_blazingmq subscriber` connections in
 `pg_stat_activity` after finishing.
+
+## Consumer Count 4/8/16/32: Dispatcher-Pool Sizing Was Part Of It, But Not All Of It
+
+The 2-consumer regression above was tested with the broker's *default*
+`dispatcherConfig` (`sessions`/`queues`/`clusters.numProcessors` all at
+their stock 4/8/4) - 1 producer + 2 consumers is only 3 concurrent
+sessions, comfortably under a pool of 4, so pool sizing wasn't actually
+the missing piece for that specific case. But it was never verified at
+higher consumer counts, where total session count (producer + consumers)
+does exceed the default pools. Retested at 4/8/16/32 consumers with all
+three pools *and* `tcpInterface.ioThreads` explicitly set to match total
+session count each time (5/9/17/33), fresh broker restart before every
+rate probe (a methodology slip mid-run - reusing one broker across three
+rate probes in a row produced an impossible "consumed > published" result
+from a prior run's undrained leftover backlog contaminating the next
+probe's numbers - caught before trusting it, redone with a fresh restart
+per probe from then on):
+
+| consumers | ceiling (backlog stays bounded) | first rate that grows unbounded |
+|---|---|---|
+| 1 (baseline, from above) | ~42,000-45,000/s | 48,000/s |
+| 4 | ~32,000/s (38,000/s starts clean, destabilizes ~13s in) | 38,000/s |
+| 8 | ~40,000-42,000/s | 47,000/s |
+| 16 | ~40,000-45,000/s | 47,000/s |
+| 32 | ~40,000/s (noisier: backlog oscillates 37k-105k vs 8's tighter 9k-24k band, but no growth trend) | 45,000/s |
+
+**The honest answer: dispatcher-pool sizing explains why 8/16/32
+consumers no longer collapse catastrophically the way the under-pooled
+2-consumer test did (all three now land in the same 40-45k/s band as 1
+consumer, not the 2-consumer test's 3,999/s), but it does not explain why
+more consumers never beats 1 consumer.** N=4 is actually the worst of
+the properly-pooled configurations (~32k/s, below the 1-consumer
+ceiling), and N=8/16/32 all converge on essentially the *same* ~40-42k/s
+ceiling as N=1 - not a step up, just a plateau. Every configuration
+eventually hits the identical wall: a rate around 47-48k/s where the
+backlog stops staying flat and starts climbing, regardless of how many
+consumers are pulling from it. This is consistent with (though not
+independently reconfirmed by new profiling here - a `perf` capture taken
+during a *working* 45,000/s/16-consumer run showed only the
+already-documented `StackTraceTestAllocator`/protocol-parse overhead, no
+new contention symbol) the standing explanation from the section above:
+publish-side cost itself scales with backlog size
+(`RootQueueEngine::afterNewMessage()`/`deliverMessage()`), so the ceiling
+is set by how fast the *producer* can keep publishing before its own
+cost curve turns upward - not by how much drain capacity is available on
+the consumer side. Adding consumers can't fix a producer-side cost
+mechanism.
+
+**Revised practical answer**: 1 consumer, priority mode,
+`batch_confirm=true`, ~42,000-45,000/s remains both the simplest and the
+best configuration found. More consumers (properly pooled) don't hurt the
+way an under-pooled setup does, but they also don't help - use exactly
+one consumer per queue for this workload shape unless there's a reason
+besides raw throughput (e.g. consumer-process fault tolerance) to run
+more.
+
+Config changes reverted the same way as every prior section
+(`git status --short` clean in `~/blazingmq`), broker stopped, no
+leftover `pg_blazingmq subscriber` connections.
