@@ -1358,3 +1358,76 @@ in this document - only the shape across N is the claim).
 Teardown clean: `nats-server` and every consumer/publisher process
 terminated after each configuration; perf data files not committed
 (large, machine-specific).
+
+## Multiple real `nats_sidecar` instances under one queue group: filtered throughput
+
+Follow-up to both of the above: does *filtered* throughput (real
+`nats_sidecar` instances doing deserialize → `matching_engine` evaluation
+→ republish, not raw message delivery) scale with instance count the way
+raw NATS queue-group delivery did, or does the filtering work itself
+become the bottleneck the way `bmqeval` did on the BlazingMQ side?
+
+Setup: N separate `nats_sidecar` processes (CLI-only, no config file),
+same input subject (`sc.test.in`), same `--queue-group` (genuine
+competition, not independent fan-out copies), same one-attribute schema
+(`region:integer`), `atree` engine, same output prefix. Each instance's
+filter (`region = 1`) registered individually via its own
+`--subscribe-subject` for deterministic setup rather than relying on
+control-plane fan-out timing. A separate publisher process (100,000
+messages, `region` uniform over 8 values) and a separate downstream
+consumer process, both distinct from every sidecar process. Fresh
+`nats-server -js` restart per N (an isolated, empty JetStream store dir
+each time - `nats_sidecar`'s lease manager needs NATS KV, so `-js` can't
+be dropped the way the pure-core-NATS tests above did; a leftover-stream
+contamination repeat was avoided by using a throwaway store directory,
+not the default one).
+
+First run (each instance's `--workers` left at its default,
+`hardware_concurrency()` = 24 on this machine):
+
+| N | publish rate | filtered rate (matches/s) | correctness |
+|---|---|---|---|
+| 1 | 589,870/s | 2,852/s | 12,695/12,695, 0 wrong-region |
+| 2 | 575,405/s | 5,211/s | 12,318/12,318, 0 wrong-region |
+| 4 | 444,773/s | 8,847/s | 12,458/12,458, 0 wrong-region |
+| 8 | 390,408/s | 15,307/s | 12,419/12,419, 0 wrong-region |
+
+Real, substantial scaling (~5.4x at N=8) with perfect correctness at
+every N - a completely different shape from BlazingMQ's filtered
+multi-consumer collapse (2 consumers there dropped *below* 1 consumer's
+rate). But publish rate declining with N was a red flag: each instance
+defaults to 24 worker threads, so N=8 instances means 192 worker threads
+contending for this machine's 24 real cores - a CPU-oversubscription
+confound from running many instances on one box, not evidence about the
+horizontal-scaling approach itself. Re-run with `--workers 2` per
+instance (16 total at N=8, within the real core budget):
+
+| N | publish rate | filtered rate (matches/s) | correctness |
+|---|---|---|---|
+| 1 | 597,778/s | 3,805/s | 12,584/12,584, 0 wrong-region |
+| 2 | 583,661/s | 6,918/s | 12,388/12,388, 0 wrong-region |
+| 4 | 510,293/s | 11,260/s | 12,599/12,599, 0 wrong-region |
+| 8 | 404,352/s | 25,298/s | 12,724/12,724, 0 wrong-region |
+
+Confirms the hypothesis directly: scaling improves from ~5.4x to ~6.65x
+at N=8 once the oversubscription confound is removed, and is close to
+linear through N=4 (1.82x, 2.96x, 6.65x at N=2/4/8) - still zero sign of
+collapse at any N tested.
+
+**Conclusion: `nats_sidecar` shows the raw-NATS-queue-group shape (real,
+if imperfectly linear, scaling), not the BlazingMQ-filtered shape
+(collapse under multi-consumer contention).** NATS's own transport
+appears to be the limiting factor here, not `matching_engine` evaluation
+cost - unlike BlazingMQ, where the filtering mechanism itself was the
+bottleneck independent of the transport. Practical implication: running
+multiple `nats_sidecar` instances under one queue group is a genuinely
+effective way to scale filtered throughput, provided each instance's
+`--workers` is sized against the real core budget when co-located with
+other instances (don't leave it at the hardware-autodetected default
+when running N instances on one machine).
+
+Caveat matching the two sections above: `nats-py` client, so absolute
+rates aren't comparable to this document's C++-tool numbers elsewhere -
+only the shape across N and the BlazingMQ comparison are the claims.
+Teardown clean: all sidecar/publisher/consumer/`nats-server` processes
+terminated after each configuration, verified via `ps`.
