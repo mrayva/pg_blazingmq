@@ -54,3 +54,32 @@ SELECT * FROM bmq_consume('bmq://bmq.test.mem.priority/pgregress_consume_bad', N
 ERROR:  max_messages must be >= 1
 SELECT * FROM bmq_consume('bmq://bmq.test.mem.priority/pgregress_consume_bad', NULL, 1, -1);
 ERROR:  timeout_ms must be >= 0
+-- batch_confirm=true (0.5+): same content round trip as the basic case
+-- above, just confirmed as one batch instead of per-message - the
+-- resulting payload set must be identical either way.
+SELECT bmq_publish_row('bmq://bmq.test.mem.priority/pgregress_consume_batch', pgregress_consume_trades, ARRAY['region'])
+FROM pgregress_consume_trades;
+ bmq_publish_row 
+-----------------
+ 
+ 
+(2 rows)
+
+SELECT msgpack_to_jsonb(bmq_consume) AS payload
+FROM bmq_consume('bmq://bmq.test.mem.priority/pgregress_consume_batch', NULL, 5, 3000, true)
+ORDER BY (msgpack_to_jsonb(bmq_consume)->>'region')::int;
+                             payload                              
+------------------------------------------------------------------
+ {"price": 150.25, "active": true, "region": 1, "symbol": "AAPL"}
+ {"price": 305.5, "active": false, "region": 2, "symbol": "MSFT"}
+(2 rows)
+
+-- And a batch really is confirmed - re-consuming the same queue afterward
+-- must find it empty, exactly like the non-batched path would.
+SELECT count(*) AS post_batch_count
+FROM bmq_consume('bmq://bmq.test.mem.priority/pgregress_consume_batch', NULL, 5, 500, true);
+ post_batch_count 
+------------------
+                0
+(1 row)
+

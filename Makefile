@@ -9,8 +9,9 @@ OBJS = pg_blazingmq.o
 
 EXTENSION = pg_blazingmq
 DATA = pg_blazingmq--0.1.sql pg_blazingmq--0.2.sql pg_blazingmq--0.3.sql \
-       pg_blazingmq--0.4.sql pg_blazingmq--0.1--0.2.sql \
-       pg_blazingmq--0.2--0.3.sql pg_blazingmq--0.3--0.4.sql
+       pg_blazingmq--0.4.sql pg_blazingmq--0.5.sql pg_blazingmq--0.1--0.2.sql \
+       pg_blazingmq--0.2--0.3.sql pg_blazingmq--0.3--0.4.sql \
+       pg_blazingmq--0.4--0.5.sql
 
 # Sequential on purpose: pg_regress runs each file as its own fresh psql
 # connection (so g_session/g_queues start clean per file, matching what

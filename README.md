@@ -31,12 +31,23 @@ can be attributes - naming an ineligible column (e.g. a `float8`) is a
 clear error, raised before any network call. If `attr_columns` is omitted,
 every eligible column is promoted automatically.
 
-`bmq_consume(queue_uri, subscription_expr, max_messages, timeout_ms)`
-(Phase 3) synchronously pulls up to `max_messages` payloads, waiting up to
-`timeout_ms` total. Each received message is confirmed immediately - no
-separate ack step in this first cut. `subscription_expr`, if given, is
-BlazingMQ's own `bmqeval` expression, applied server-side: only matching
-messages are delivered to this handle at all.
+`bmq_consume(queue_uri, subscription_expr, max_messages, timeout_ms,
+batch_confirm)` (Phase 3) synchronously pulls up to `max_messages`
+payloads, waiting up to `timeout_ms` total. `subscription_expr`, if given,
+is BlazingMQ's own `bmqeval` expression, applied server-side: only
+matching messages are delivered to this handle at all.
+
+By default (`batch_confirm = false`), each received message is confirmed
+individually, immediately after being added to the result set - a mid-call
+error only leaves whatever wasn't added yet unconfirmed. `batch_confirm =
+true` (0.5+) instead accumulates confirmations in one
+`bmqa::ConfirmEventBuilder` and sends them as a single batch
+(`session.confirmMessages()`) only after the whole call's receive loop
+finishes - fewer, larger CONFIRM wire messages, measurably faster on
+sustained pulls (see `bench/README.md`), but a wider at-least-once
+redelivery window: if the backend dies before that final flush, *every*
+message received so far in that call is redelivered, not just the last
+one.
 
 The session is held per-backend (lazily started on first use, stopped via
 `on_proc_exit`). Queue handles are cached per URI for the backend's

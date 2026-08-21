@@ -58,6 +58,7 @@ PGDLLEXPORT void bmq_subscriber_main(Datum main_arg);
 #include <bmqa_event.h>
 #include <bmqa_messageevent.h>
 #include <bmqa_messageiterator.h>
+#include <bmqa_confirmeventbuilder.h>
 #include <bmqt_sessionoptions.h>
 #include <bmqt_uri.h>
 #include <bmqt_queueflags.h>
@@ -474,6 +475,7 @@ Datum bmq_consume(PG_FUNCTION_ARGS)
 
     int32 max_messages = PG_ARGISNULL(2) ? 1 : PG_GETARG_INT32(2);
     int32 timeout_ms = PG_ARGISNULL(3) ? 1000 : PG_GETARG_INT32(3);
+    bool batch_confirm = PG_ARGISNULL(4) ? false : PG_GETARG_BOOL(4);
     if (max_messages < 1) ereport(ERROR, (errmsg("max_messages must be >= 1")));
     if (timeout_ms < 0) ereport(ERROR, (errmsg("timeout_ms must be >= 0")));
 
@@ -494,6 +496,17 @@ Datum bmq_consume(PG_FUNCTION_ARGS)
     try {
         bmqa::Session& session = get_session();
         bmqa::QueueId& queueId = get_queue(session, queue_uri, subscription_expr);
+
+        // batch_confirm=true: accumulate CONFIRMs in one bmqa::ConfirmEventBuilder
+        // and flush via session.confirmMessages() instead of confirming each
+        // message individually - fewer, larger wire messages, at the cost of a
+        // wider at-least-once redelivery window (see README): if this backend
+        // dies before a flush, every message batched into it since the last
+        // flush is redelivered, not just the one in flight.
+        bmqa::ConfirmEventBuilder confirmBuilder;
+        if (batch_confirm) {
+            session.loadConfirmEventBuilder(&confirmBuilder);
+        }
 
         auto deadline = std::chrono::steady_clock::now() +
             std::chrono::milliseconds(timeout_ms);
@@ -530,14 +543,43 @@ Datum bmq_consume(PG_FUNCTION_ARGS)
                 tuplestore_putvalues(tupstore, tupdesc, values, nulls);
                 ++received;
 
-                int confirm_rc = session.confirmMessage(msg);
-                if (confirm_rc != 0) {
-                    ereport(WARNING,
-                            (errmsg("failed to confirm BlazingMQ message on queue '%s' (rc=%d)",
-                                    queue_uri.c_str(), confirm_rc)));
+                if (batch_confirm) {
+                    bmqt::EventBuilderResult::Enum add_rc = confirmBuilder.addMessageConfirmation(msg);
+                    if (add_rc != bmqt::EventBuilderResult::e_SUCCESS) {
+                        // Builder hit its wire-size limit - flush what we have
+                        // (this also resets the builder) and retry once.
+                        int flush_rc = session.confirmMessages(&confirmBuilder);
+                        if (flush_rc != 0) {
+                            ereport(WARNING,
+                                    (errmsg("failed to flush batched BlazingMQ confirms on queue '%s' (rc=%d)",
+                                            queue_uri.c_str(), flush_rc)));
+                        }
+                        add_rc = confirmBuilder.addMessageConfirmation(msg);
+                        if (add_rc != bmqt::EventBuilderResult::e_SUCCESS) {
+                            ereport(WARNING,
+                                    (errmsg("failed to batch BlazingMQ confirm on queue '%s' (rc=%d)",
+                                            queue_uri.c_str(), (int) add_rc)));
+                        }
+                    }
+                } else {
+                    int confirm_rc = session.confirmMessage(msg);
+                    if (confirm_rc != 0) {
+                        ereport(WARNING,
+                                (errmsg("failed to confirm BlazingMQ message on queue '%s' (rc=%d)",
+                                        queue_uri.c_str(), confirm_rc)));
+                    }
                 }
             }
             (void)queueId;
+        }
+
+        if (batch_confirm && confirmBuilder.messageCount() > 0) {
+            int flush_rc = session.confirmMessages(&confirmBuilder);
+            if (flush_rc != 0) {
+                ereport(WARNING,
+                        (errmsg("failed to flush batched BlazingMQ confirms on queue '%s' (rc=%d)",
+                                queue_uri.c_str(), flush_rc)));
+            }
         }
     } catch (const std::exception& ex) {
         ereport(ERROR,
