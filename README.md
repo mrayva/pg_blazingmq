@@ -233,4 +233,37 @@ See the project's own notes for the full phased plan:
    mirroring `pgnats`'s `nats_subscribe(subject, fn_oid)`.
 5. **Tests** (done) - `pg_regress` suite against a real single-node broker,
    `make test` as the one-command entry point (see Testing above).
-6. **Docs**.
+6. **Docs** (done) - see Changelog and Maintained Documentation below.
+
+## Changelog
+
+Each entry corresponds to one `pg_blazingmq--X.Y.sql` version; see those
+files for the exact functions each version added. This extension hasn't
+reached 1.0 yet - versions below that should be considered unstable.
+
+- **0.4** -- Added push-consume: `bmq_subscribe(queue_uri, callback_fn,
+  subscription_expr)` / `bmq_unsubscribe(worker_pid)`. A dynamic
+  background worker per subscription, config handed off via a pinned DSM
+  segment, an atomic readiness handshake closing the race between "worker
+  process started" and "worker's queue is actually open", and
+  per-message SPI transaction dispatch with at-least-once delivery.
+- **0.3** -- Added pull-consume: `bmq_consume(queue_uri, subscription_expr,
+  max_messages, timeout_ms)`. Unified the publish/consume queue-handle
+  cache into one handle per URI with combined READ+WRITE flags, after
+  discovering BlazingMQ rejects opening the same URI twice from one
+  session.
+- **0.2** -- Added `bmq_publish_row(queue_uri, row_data, attr_columns)`:
+  column-to-property promotion for server-side filtering, plus
+  zerialize-packed payloads.
+- **0.1** -- Initial release: `pg_blazingmq_link_check(broker_uri)`,
+  proof-of-linkage against the full BDE/NTF/bmq client stack.
+
+(Phase 5's test suite added no new SQL surface, so it didn't bump the
+version.)
+
+## Maintained Documentation
+
+- [`QUICKSTART.md`](QUICKSTART.md): install, build, and first usage
+- [`ARCHITECTURE.md`](ARCHITECTURE.md): session/queue lifecycle, the
+  column-to-property/payload split, and the DSM/background-worker design
+  behind push-consume
