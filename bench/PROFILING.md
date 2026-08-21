@@ -84,3 +84,32 @@ Debug-build-only cost. Re-running this same profile against a Release
 build of `bmqbrkr.tsk` would be the natural next step to separate "real,
 structural BlazingMQ overhead" from "overhead specific to this session's
 unoptimized broker build."
+
+## Update: re-profiled after the Release rebuild - the hypothesis was wrong
+
+The "Debug-build-only cost" guess above turned out to be incorrect. After
+rebuilding `bmqbrkr.tsk` with `-DCMAKE_BUILD_TYPE=RelWithDebInfo` (see
+`README.md`'s "Release-Mode Rebuild" section) and re-profiling the same
+broadcast + `batch_confirm` workload (500,000 rows, 202,531 samples),
+`_Unwind_Find_FDE` is **still the single largest symbol - 7.26% self time,
+higher than the Debug build's 2.80%**, not lower. The call graph traces it
+precisely to `BloombergLP::balst::StackTraceTestAllocator::allocate()`,
+via `bsls::StackAddressUtil::getStackAddresses()` → `__backtrace` →
+`_Unwind_Backtrace`. This is a **broker-config choice**
+(`bmqbrkrcfg.json`'s `taskConfig.allocatorType`, shipped as
+`STACKTRACETEST` in BlazingMQ's own `docker/single-node/config` - used by
+every benchmark in this repo), not a compiler-optimization artifact - it
+has nothing to do with `CMAKE_BUILD_TYPE` at all.
+
+Testing the other two `allocatorType` options directly (`README.md` has
+the full table) produced a genuinely counterintuitive result:
+`STACKTRACETEST` - the one doing a full stack-trace capture on every
+allocation - is roughly **2x faster** than plain `NEWDELETE` or
+`COUNTING`, reproduced across multiple runs. So the unwind cost visible in
+this profile is real, but it's not a tax worth removing: whatever
+allocation strategy `StackTraceTestAllocator` uses underneath evidently
+matters far more than the capture overhead for BlazingMQ's actual
+allocation pattern. See `README.md`'s "The Real Headline Finding" section
+for the full writeup - this is the actual answer to "what is BlazingMQ
+spending time on," more so than the Debug/Release distinction that
+prompted this re-profile in the first place.

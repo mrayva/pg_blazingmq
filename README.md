@@ -174,11 +174,18 @@ cd thirdparty/ntf-core && ./configure --prefix "$(pwd)/../.." --output build/ntf
 # bmq client group only (mqb/broker-internals aren't needed by a client)
 export DIR_THIRDPARTY="$(pwd)/thirdparty" DIR_BUILD="$(pwd)/build" DIR_INSTALL="$(pwd)"
 export PATH="$(pwd)/thirdparty/bde-tools/bin:$PATH"
-cmake --preset ubuntu-x64 -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+cmake --preset ubuntu-x64 -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cd build/blazingmq && ninja libbmqa.a libbmqc.a libbmqeval.a libbmqex.a \
   libbmqimp.a libbmqio.a libbmqma.a libbmqp.a libbmqpi.a libbmqscm.a \
   libbmqst.a libbmqstm.a libbmqt.a libbmqtsk.a libbmqu.a libbmqvt.a libbmq.a
 ```
+
+`-DCMAKE_BUILD_TYPE` isn't set by the `ubuntu-x64` preset itself, so it
+silently defaults to CMake's own default (`Debug`, unoptimized) unless
+passed explicitly - `RelWithDebInfo` was measured to be 0-20% faster than
+Debug across every `bmq_publish_row`/`bmq_consume` benchmark variant (see
+`bench/README.md`'s "Release-Mode Rebuild" section), for no real downside
+(same `-O2`/`-DNDEBUG` as plain `Release`, keeps debug symbols).
 
 Then:
 

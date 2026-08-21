@@ -287,3 +287,85 @@ fair NATS-side number, measure end-to-end per-message publish-to-delivery
 *latency* (not a rate derived from a coarse periodic counter) rather than
 trying to force NATS's push model into a "receive rate" shape built for
 pg_blazingmq's pull model.
+
+## Release-Mode Rebuild (Debug-Build Tax Quantified)
+
+`PROFILING.md`'s `perf` profile of `bmqbrkr.tsk` surfaced that the broker's
+`bmq`/`mqb` CMake group had been building as `CMAKE_BUILD_TYPE=Debug` this
+entire session - unset in `CMakePresets.json`'s `ubuntu-x64` preset, so it
+silently fell back to CMake's own default, while BDE/NTF (built separately
+via `bde-tools`) were already genuinely optimized (`-O2 -DNDEBUG`, verified
+in `build/bde/build.ninja`). Reconfigured with
+`-DCMAKE_BUILD_TYPE=RelWithDebInfo` (same `-O2`/`-DNDEBUG` as `Release`,
+keeps debug symbols for future `perf` work) and rebuilt the same minimal
+target set (`README.md`'s Building section). All 5 benchmark variants
+re-run with the same fresh-broker-restart-per-variant discipline as the
+prior section, 100,000 rows, `nyse_eqy_us_all_trade_20260102`:
+
+| variant | Debug receive rate | Release receive rate |
+|---|---|---|
+| priority, immediate confirm | 30,767/s | 31,038/s |
+| broadcast, immediate confirm | 72,744/s | 87,531/s |
+| priority, `batch_confirm=true` | 54,369/s | 64,090/s |
+| broadcast + `batch_confirm`, with properties | 71,981-75,485/s | 86,395/s |
+| broadcast + `batch_confirm`, no properties | 46,777/s | 84,329/s |
+
+Two real findings, not just "Release is faster":
+
+- **The Debug-build tax was real but partial** (~0-20% depending on
+  variant) - it does not remotely explain the earlier ~1.5x gap to NATS
+  core's publish rate (a comparison this document no longer makes, see
+  above, but worth noting the magnitude here for context).
+- **The earlier "removing properties makes receive rate worse" finding
+  (46,777/s vs 71,981-75,485/s in the Debug build) does not reproduce in
+  Release** - with and without properties are statistically
+  indistinguishable (84,329/s vs 86,395/s). That earlier result was itself
+  a Debug-build artifact, not a real property-encoding effect.
+
+**Recommendation**: use `-DCMAKE_BUILD_TYPE=RelWithDebInfo` (or `Release`)
+when building BlazingMQ's `bmq` group for anything performance-sensitive -
+`README.md`'s Building section has been updated accordingly.
+
+## The Real Headline Finding: `allocatorType`, Not Build Type
+
+Re-profiling the Release build with `perf record -g` (see `PROFILING.md`)
+found `_Unwind_Find_FDE` *still* the single largest symbol - 7.26% self
+time, actually **higher** than the Debug build's 2.80%, not lower. The
+call graph traces it precisely: `BloombergLP::mqbs::InMemoryStorage::put`
+/ `mqba::ClientSession::onPutEvent` → `bsl::vector::reserve` →
+`BloombergLP::balst::StackTraceTestAllocator::allocate()` →
+`bsls::StackAddressUtil::getStackAddresses()` → `__backtrace` →
+`_Unwind_Backtrace` → `_Unwind_Find_FDE`. This has nothing to do with
+`CMAKE_BUILD_TYPE` - it's `bmqbrkrcfg.json`'s `taskConfig.allocatorType`,
+a broker-config field with three options (`mqbcfg.xsd`'s `AllocatorType`
+enum: `NEWDELETE`, `COUNTING`, `STACKTRACETEST`). The scratch broker's
+config - copied verbatim from BlazingMQ's own
+`docker/single-node/config/bmqbrkrcfg.json`, used by **every single
+benchmark run in this entire document** - sets `STACKTRACETEST`: an
+allocator that captures a full stack trace on every allocation, clearly a
+debugging aid, not a production/benchmarking default.
+
+Tested all three options directly (broadcast + `batch_confirm`, with
+properties, Release build, fresh broker per run, 100,000 rows):
+
+| `allocatorType` | receive rate |
+|---|---|
+| `STACKTRACETEST` (the shipped default, used everywhere above) | 86,395/s |
+| `NEWDELETE` | 40,107/s, 43,388/s (2 runs) |
+| `COUNTING` | 45,958/s |
+
+**Counterintuitive and reproduced twice**: `STACKTRACETEST` is not just
+"not the bottleneck it looked like" - it's roughly **2x faster** than
+either alternative, despite doing far more work per allocation (capturing
+and resolving a full stack trace). The stack-unwind cost visible in the
+`perf` profile is real, but whatever pooling/arena strategy
+`StackTraceTestAllocator` uses underneath evidently outweighs it by a wide
+margin for BlazingMQ's actual allocation pattern here - plain `NEWDELETE`
+(routing every allocation through glibc `malloc`/`free`) and `COUNTING`
+(lighter bookkeeping, no stack capture) are both markedly *worse*, not
+better. Not fully root-caused why (would need to profile the `NEWDELETE`
+run directly to see what's actually slow there instead of assuming); worth
+revisiting if this ever becomes a decision that matters for a real
+deployment, but for benchmarking purposes: **leave `allocatorType` at its
+shipped `STACKTRACETEST` default** - every number in this document already
+does, and that turns out to be the right call, not a confound to fix.
