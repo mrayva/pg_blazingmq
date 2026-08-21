@@ -684,3 +684,92 @@ Config changes (`sessions`/`queues`/`ioThreads` = N per data point) were
 made and reverted in the same scratch-broker config path as every prior
 run this session; `git status --short` in `~/blazingmq` confirmed clean
 before finishing.
+
+## The Real Explanation For "Sustained Rate Looks Lower": An Undrained Backlog, Not Duration
+
+Chased two open threads: what causes the falloff past N~9, and why a
+longer (1M-row) N=9 run measured *lower* throughput (449,448/s) than the
+100k-row run that found the 549,407/s peak.
+
+**A previously-untested third dispatcher pool, ruled out.**
+`appConfig.dispatcherConfig` actually has *three* `numProcessors` pools,
+not two - `sessions` (default 4) and `queues` (default 8), both already
+tuned in the prior section, plus `clusters` (default 4), never touched.
+Hypothesis: leaving `clusters` at 4 while `sessions`/`queues` scaled past
+4 could make it the new bottleneck at higher N. Tested directly - raised
+all three (`sessions`/`queues`/`clusters`) to 16 together: N=16 still
+landed at 214,497/s, matching the already-reported 196,541-219,975/s
+range almost exactly. `clusters.numProcessors` isn't a factor here (a
+single-node scratch broker likely never exercises this pool much
+regardless of client connection count - it's for inter-node cluster
+traffic, not client sessions/queues).
+
+**The real finding, and it's bigger than the N-vs-N falloff question:
+throughput is not duration/connection-count-dependent, it's dependent on
+how large the queue's *undrained* backlog has grown.** `parallel_bench.py`
+is publish-only - nothing ever calls `bmq_consume()` to drain what gets
+published, so every row published during one run adds to a
+monotonically-growing, never-emptied queue for that run's duration. Ran
+the same N=16 config (this time with all three pools already matched)
+at increasing row counts on a fresh broker each time:
+
+| total rows | rate |
+|---|---|
+| 100,000 | 214,497/s |
+| 300,000 (with `perf record` attached) | 28,555/s |
+| 300,000 (no profiler, re-run to rule out profiling overhead) | 5,598/s |
+
+Not profiler overhead - the *unprofiled* re-run was slower than the
+profiled one, both catastrophically below the 100k-row rate for only 3x
+the volume. This is superlinear degradation, not a fixed per-call cost:
+tripling total messages published in one run cut throughput by roughly
+40-90x, depending on run.
+
+**Root cause, confirmed via `perf record -g` on `bmqbrkr.tsk` during the
+degraded run, not inferred:** `BloombergLP::mqbblp::RootQueueEngine::
+afterNewMessage()` -> `QueueEngineUtil_AppsDeliveryContext::
+deliverMessage()` -> `QueueHandle::deliverMessageImpl()` dominates the
+profile (~25%+ of all samples nested under this one call path). This
+delivery-attempt logic runs on *every* single publish, and its cost
+scales with the size of the queue's retained/undelivered message state -
+which, in a publish-only test with no consumer ever confirming/draining
+anything, grows without bound for the whole run. Early in a run the
+backlog is small and cheap to process; by the back half of a 300k-row
+run it's large, and per-message delivery-attempt cost has grown with it -
+producing exactly the superlinear, average-throughput-craters-as-volume-
+grows pattern measured above.
+
+**This is the real explanation for the earlier N=9 1M-row discrepancy
+too** (449,448/s vs the 549,407/s 100k-row peak, same N) - not a
+duration-based "sustained state" effect, an undrained-backlog-size
+effect. A 1M-row publish-only run accumulates a much larger undelivered
+backlog than a 100k-row one by its back half, so its *average* rate is
+pulled down by the same mechanism, independent of how many concurrent
+connections are involved.
+
+**What this means for a genuinely trustworthy sustained-rate number: a
+publish-only benchmark cannot produce one.** Any number from
+`parallel_bench.py`/`bmq_bench.py` as currently written reflects
+publishing into a growing, undrained queue - not steady-state throughput
+under realistic concurrent publish+consume load, where a consumer
+draining messages would keep the backlog (and therefore the per-message
+delivery-attempt cost) small and roughly constant. The 549,407/s peak and
+every other number in this document should be read as **burst/small-
+backlog publish rates**, not sustained rates - producing a true sustained
+number requires a benchmark that runs `bmq_consume()` (or `bmq_subscribe()`)
+concurrently with publish, keeping the backlog bounded, which no
+benchmark in this repo does yet. This is flagged here rather than solved
+- building that concurrent publish+drain benchmark is real, additional
+scope beyond this investigation.
+
+**Practical implication for anyone deploying pg_blazingmq**: this is a
+strong argument for consuming promptly (a live `bmq_subscribe()` worker
+or a tight `bmq_consume()` poll loop) rather than letting messages
+accumulate unread - not just for the obvious reasons (memory/storage
+retention limits), but because the broker's own per-message delivery-
+attempt cost appears to grow with backlog size, making a large undrained
+backlog progressively more expensive to publish *into*, not just to
+eventually drain.
+
+Broker config reverted, `git status --short` clean in `~/blazingmq`,
+broker stopped, no stray processes.
