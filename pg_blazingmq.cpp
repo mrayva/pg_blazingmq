@@ -93,6 +93,15 @@ namespace bdlbb = BloombergLP::bdlbb;
 
 static char* g_broker_uri = nullptr;
 
+// bmq_consume(..., batch_confirm => true): flush the accumulated confirm
+// batch once it reaches this many messages, comfortably under the broker's
+// default per-consumer flow-control window (bmqt::QueueOptions::
+// k_DEFAULT_MAX_UNCONFIRMED_MESSAGES = 1000, unconfirmed messages the broker
+// will let accumulate before it stops sending more) - keeps large
+// max_messages pulls from stalling on that window with nothing ever
+// confirming to reopen it.
+static const int kBatchConfirmFlushThreshold = 500;
+
 void _PG_init(void)
 {
     DefineCustomStringVariable(
@@ -559,6 +568,22 @@ Datum bmq_consume(PG_FUNCTION_ARGS)
                             ereport(WARNING,
                                     (errmsg("failed to batch BlazingMQ confirm on queue '%s' (rc=%d)",
                                             queue_uri.c_str(), (int) add_rc)));
+                        }
+                    } else if (confirmBuilder.messageCount() >= kBatchConfirmFlushThreshold) {
+                        // Deferring *every* confirm to just before returning
+                        // would stall a large max_messages pull outright: the
+                        // broker's default per-consumer flow-control window
+                        // (bmqt::QueueOptions::k_DEFAULT_MAX_UNCONFIRMED_MESSAGES
+                        // = 1000) stops delivering PUSH messages once that many
+                        // are outstanding unconfirmed, and nothing here would
+                        // ever confirm any of them to reopen the window - so
+                        // flush periodically, well under that default, to keep
+                        // messages flowing for pulls bigger than one window.
+                        int flush_rc = session.confirmMessages(&confirmBuilder);
+                        if (flush_rc != 0) {
+                            ereport(WARNING,
+                                    (errmsg("failed to flush batched BlazingMQ confirms on queue '%s' (rc=%d)",
+                                            queue_uri.c_str(), flush_rc)));
                         }
                     }
                 } else {
