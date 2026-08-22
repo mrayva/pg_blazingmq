@@ -1774,3 +1774,48 @@ end to end, not anything about `matching_engine` evaluation cost,
 `nats_sidecar`'s own architecture, or this machine's hardware.
 
 Teardown confirmed clean via `ps` after every run.
+
+## `bmq_subscribe` push-consume: completing the three-way overhead comparison
+
+`~/pg_mqtt/README.md`'s "Benchmarks" section found `pg_mqtt`'s `mqtt_subscribe` and `pgnats`'s
+`nats_subscribe` land within ~10% of each other on identical per-message push-consume load
+(661/s vs 600-611/s at N=1, 20,000 messages) - both wrap every callback in one full Postgres
+transaction, and the working hypothesis was that this ~600-660/s band is a shared,
+extension-independent Postgres transaction-commit cost. `bmq_subscribe` was explicitly never
+benchmarked this way - only the pull-based `bmq_consume` was, extensively, throughout this whole
+document. This fills that gap.
+
+**Setup**: fresh broker per run, broadcast domain (`bmq.test.mem.broadcast`, `queueLimits`/
+`domainLimits.messages` temporarily raised to 25,000/50,000 for the 20,000-message run, cleanly
+reverted after - `git status --short` clean in `~/blazingmq`), `RelWithDebInfo` build (confirmed
+active, not a stale Debug build), 20,000 rows, one-row-per-message callback doing a single
+`INSERT` keyed by a sequence number (same minimal shape as the `pg_mqtt`/`pgnats` benchmarks),
+subscription established *before* publish (broadcast mode's non-retroactive-filtering semantic
+requires this - already well established elsewhere in this document).
+
+| system | N=1 drain rate |
+|---|---|
+| `pg_mqtt` (`mqtt_subscribe`, NanoMQ) | 661/s |
+| `pgnats` (`nats_subscribe`, NATS core) | 600-611/s |
+| `pg_blazingmq` (`bmq_subscribe`, BlazingMQ broadcast) | 751-976/s (two fresh-broker runs) |
+
+Correctness verified both runs: 20,000/20,000 received, 0 duplicates (distinct sequence-number
+count matched exactly).
+
+**Same order of magnitude as the other two - broadly confirms the "one Postgres transaction per
+callback costs what it costs" hypothesis - but not an exact match, and the direction is
+interesting.** `bmq_subscribe`'s dispatch path is structurally closest to `mqtt_subscribe`'s
+(both call `OidFunctionCall1` directly against an already-resolved callback OID, unlike
+`nats_subscribe`'s full `SELECT callback($1)` SQL-string dispatch via `Spi::connect_mut`) *and*
+does strictly more per-message work than either - an explicit `session.confirmMessage(msg)`
+network round-trip after every commit, which neither `pg_mqtt` nor `pgnats`'s subscribe paths
+have an equivalent of at all. Despite that extra step, `bmq_subscribe` came out faster in both
+runs (751-976/s), not slower. This doesn't overturn the shared-transaction-cost hypothesis - all
+three land within roughly a 1.6x band of each other, not orders of magnitude apart - but it does
+mean the ~600-660/s figure from the two-way comparison isn't a precise universal constant, just
+the rough floor this class of extension design pays; broker-specific round-trip characteristics
+and normal run-to-run variance (976/s vs 751/s between `bmq_subscribe`'s own two runs, a ~23%
+spread) evidently matter more than the presence or absence of one extra confirm step.
+
+Teardown confirmed clean via `ps` (no leftover `pg_blazingmq subscriber` connections in
+`pg_stat_activity` after either run) and `git status --short` clean in `~/blazingmq`.
