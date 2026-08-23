@@ -19,6 +19,7 @@
 // Usage: mq_bench_driver pub <subject> <count>
 //        mq_bench_driver sub <subject_pattern> <expected_count> <timeout_ms>
 //        mq_bench_driver ctrl <subscribe_subject> <expression>
+//        mq_bench_driver ctrl_bcast <shared_subscribe_subject> <expression> <expected_acks> <timeout_ms>
 #include <nats_asio/nats_asio.hpp>
 #include <asio/io_context.hpp>
 #include <asio/co_spawn.hpp>
@@ -33,6 +34,7 @@
 #include <chrono>
 #include <atomic>
 #include <cstring>
+#include <random>
 
 namespace z = zerialize;
 using json = nlohmann::json;
@@ -230,6 +232,81 @@ asio::awaitable<void> do_ctrl(asio::io_context& ioc, std::string subject, std::s
     co_return;
 }
 
+// ctrl_bcast <shared_subscribe_subject> <expression> <expected_acks> <timeout_ms>:
+// the client-assigned-ID redesign - ONE publish to a subject every instance
+// listens on (fan-out, not a per-instance-unique subject), instead of
+// do_ctrl's one-request-per-instance loop. The client mints its own 64-bit
+// subscription ID and computes the output topic from it *before* publishing
+// - no reply is needed to know where to subscribe for matches. The optional
+// reply-to/ack collection here is confirmation/diagnostics only (how many
+// of the N instances actually picked it up within the timeout), not on the
+// critical path to knowing the output topic.
+asio::awaitable<void> do_ctrl_bcast(asio::io_context& ioc, std::string subject, std::string expr,
+                                     int expected_acks, int timeout_ms) {
+    std::atomic<bool> connected{false};
+    auto conn = make_conn(ioc, connected);
+    nats_asio::connect_config conf;
+    conf.address = "127.0.0.1";
+    conf.port = 4222;
+    conn->start(conf);
+    co_await wait_connected(ioc, connected);
+
+    std::mt19937_64 rng(std::random_device{}());
+    uint64_t sub_id = rng();
+
+    std::string inbox = nats_asio::generate_inbox();
+    auto acks = std::make_shared<std::atomic<int>>(0);
+    auto errors = std::make_shared<std::atomic<int>>(0);
+
+    nats_asio::subscribe_options opts; // no max_messages - want every ack, not just the first
+    auto [inbox_sub, inbox_status] = co_await conn->subscribe(
+        inbox,
+        [acks, errors](nats_asio::string_view, std::optional<nats_asio::string_view>,
+                        std::span<const char> payload) -> asio::awaitable<void> {
+            try {
+                auto j = json::parse(std::string_view(payload.data(), payload.size()));
+                if (j.contains("error")) errors->fetch_add(1);
+                else acks->fetch_add(1);
+            } catch (...) {
+                errors->fetch_add(1);
+            }
+            co_return;
+        },
+        opts);
+    if (inbox_status.failed()) {
+        std::cerr << "CTRL_BCAST_FAIL inbox subscribe: " << inbox_status.error() << "\n";
+        ioc.stop();
+        co_return;
+    }
+
+    json req = {{"expression", expr}, {"client_id", "bench"}, {"id", sub_id}};
+    std::string req_str = req.dump();
+    std::span<const char> payload(req_str.data(), req_str.size());
+    auto t0 = std::chrono::steady_clock::now();
+    auto pub_status = co_await conn->publish(subject, payload, inbox);
+    if (pub_status.failed()) {
+        std::cerr << "CTRL_BCAST_FAIL publish: " << pub_status.error() << "\n";
+        ioc.stop();
+        co_return;
+    }
+
+    asio::steady_timer t(ioc);
+    auto deadline = t0 + std::chrono::milliseconds(timeout_ms);
+    while (acks->load() + errors->load() < expected_acks &&
+           std::chrono::steady_clock::now() < deadline) {
+        t.expires_after(std::chrono::milliseconds(5));
+        co_await t.async_wait(asio::use_awaitable);
+    }
+    auto t1 = std::chrono::steady_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    std::cout << "CTRL_BCAST_ID " << sub_id << "\n";
+    std::cout << "CTRL_BCAST_ACKS " << acks->load() << " errors=" << errors->load()
+              << " expected=" << expected_acks << " latency_ms=" << ms << "\n";
+    ioc.stop();
+    co_return;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) { std::cerr << "usage: mq_bench_driver <pub|sub|ctrl> ...\n"; return 1; }
     std::string mode = argv[1];
@@ -243,6 +320,9 @@ int main(int argc, char** argv) {
                                          argv[5], argv[6]), asio::detached);
     } else if (mode == "ctrl" && argc == 4) {
         asio::co_spawn(ioc, do_ctrl(ioc, argv[2], argv[3]), asio::detached);
+    } else if (mode == "ctrl_bcast" && argc == 6) {
+        asio::co_spawn(ioc, do_ctrl_bcast(ioc, argv[2], argv[3], std::atoi(argv[4]),
+                                           std::atoi(argv[5])), asio::detached);
     } else {
         std::cerr << "bad args\n";
         return 1;
